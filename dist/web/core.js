@@ -471,6 +471,7 @@ class Parser {
                 return this.parseBitmap();
             default:
                 this.error(`Unknown command: '${tok.value}'`);
+                this.advance();
                 return undefined;
         }
     }

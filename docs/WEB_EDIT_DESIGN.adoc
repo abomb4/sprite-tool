@@ -1,0 +1,1847 @@
+= Sprite DSL Web Editor — 工程落地设计文档
+:toc: left
+:toclevels: 3
+:sectnums:
+:source-highlighter: highlight.js
+
+== 概述
+
+本文档描述 Sprite DSL Web 编辑器的工程落地细节，涵盖架构设计、技术选型、组件体系、构建配置、数据流、工具系统等。
+
+=== 核心目标
+
+- 以 **DSLProgram (AST)** 为单一数据源（Single Source of Truth），实现**文本编辑器 ↔ 画布**双向实时同步
+- 使用 **Vue 3 Options API** 管理 UI 状态，保持代码直观可维护
+- 使用 **Vite** 作为构建工具，替代当前 `tsc + build-web.js` 的手动打包方式
+- **core 层保持零框架依赖**，纯 TypeScript，CLI 和 Web 共用
+
+=== 文档约定
+
+- `src/core/` — 纯 TS 核心模块，零框架依赖，CLI + Web 共用
+- `src/web/` — Vue 3 应用，依赖 Vue + Vite
+- `src/cli/` — CLI 入口，纯 Node.js
+
+== 技术选型
+
+[cols="1,2,3,3"]
+|===
+| 层级 | 选型 | 版本 | 选型理由
+| 框架 | Vue 3 Options API | ^3.4 | 用户指定；Options API 在复杂度适中时比 Composition API 更直观；`data/computed/methods/watch` 清晰分离
+| 构建工具 | Vite 5 | ^5.4 | Vue 3 生态标准构建工具；HMR 开发体验好；默认使用 Rollup 打包；自动处理 TypeScript（esbuild）
+| 代码编辑器 | CodeMirror 6 | ^6.0 | 包体积小（gzip ~40KB）；支持自定义 DSL 语法高亮；无框架绑定；支持虚拟滚动
+| 语言 | TypeScript | ^5.5 | 项目已有，保持一致
+| 样式 | Scoped CSS（Vue SFC）| - | 无需额外 CSS 框架；项目 UI 复杂度适中
+| 状态管理 | Vue 3 `reactive` + `provide/inject` | 内置 | 无需 Pinia/Vuex；编辑器状态以 AST 为核心，单组件树层级浅
+| 核心模块 | 纯 TypeScript | - | 保持 CLI 和 Web 共用；core 不引入任何框架依赖
+| 包管理 | npm | - | 项目已有
+|===
+
+== 现有架构 → 目标架构
+
+=== 当前架构（迁移前）
+
+[source]
+----
+src/web/
+  ├── index.html        # 全量 HTML（内联 CSS）+ textarea 编辑器
+  ├── app.ts            # 纯 TS 逻辑：DOM 操作 + 事件绑定 + renderToCanvas
+  └── (无 package.json 的 web 依赖，全量编译后通过 build-web.js 拷贝文件)
+
+build/
+  └── build-web.js      # 手动拷贝 JS + HTML 到 dist/web/
+
+构建流程:
+  tsc → 编译全部 src/
+  build-web.js → 拷贝 dist/core/index.js → dist/web/core.js
+              → 拷贝 dist/web/app.js → 修复 import 路径
+              → 拷贝 index.html → dist/web/
+  serve dist/web/
+
+痛点:
+  1. 无 HMR（热更新），每次修改需全量编译
+  2. 无 CSS 模块化、无组件化
+  3. 构建脚本手动处理依赖拷贝
+  4. 无法使用 Vue/Vite 生态
+----
+
+=== 目标架构（迁移后）
+
+[source]
+----
+src/web/
+  ├── index.html          # Vue 挂载点（最小 HTML）
+  ├── main.ts             # Vue 应用入口
+  ├── App.vue             # 根组件
+  ├── components/         # Vue 组件
+  │   ├── AppHeader.vue
+  │   ├── Toolbar.vue
+  │   ├── EditorArea.vue
+  │   ├── CodeEditor.vue
+  │   ├── CanvasEditor.vue
+  │   ├── canvas/         # 画布层组件
+  │   ├── panels/         # 面板组件（二期）
+  │   └── ErrorPanel.vue
+  ├── stores/
+  │   └── editorStore.ts  # 全局状态
+  ├── tools/              # 工具逻辑（与视图解耦）
+  │   ├── BaseTool.ts
+  │   ├── RectTool.ts
+  │   └── ...
+  └── types.ts            # Web 侧类型
+
+构建流程:
+  vite build → 自动打包 HTML + JS + CSS → dist/web/
+
+改进:
+  1. HMR 开发体验
+  2. Vue SFC 组件化 + Scoped CSS
+  3. TypeScript 由 Vite（esbuild）自动处理
+  4. Vite 自动分包、资源哈希、Tree Shaking
+----
+
+== 目录结构与文件职责
+
+=== 完整文件清单
+
+[source]
+----
+sprite-dsl-tools/
+├── build/
+│   └── build-web.js              # 【废弃】Vite 构建后不再需要
+├── docs/
+│   ├── DSL_DESIGN.adoc           # DSL 语言设计（不变）
+│   └── WEB_EDIT_DESIGN.adoc      # ← 本文档
+├── src/
+│   ├── core/
+│   │   └── index.ts              # 纯 TS：parseDSL / render / renderDSL + 新增 generateDSL
+│   ├── cli/
+│   │   └── index.ts              # CLI 入口（不变）
+│   └── web/                      # ★ Vue 应用（重点改造）
+│       ├── index.html            # Vue 挂载点
+│       ├── main.ts               # createApp(App).mount('#app')
+│       ├── App.vue               # 布局框架：Header + Toolbar + EditorArea + StatusBar
+│       ├── components/
+│       │   ├── AppHeader.vue         # 标题栏 + 导出/撤销/重做按钮
+│       │   ├── Toolbar.vue           # 工具选择 + 颜色选择 + 线条半径
+│       │   ├── EditorArea.vue        # 左右分栏容器
+│       │   ├── CodeEditor.vue        # CodeMirror 6 封装组件
+│       │   ├── CanvasEditor.vue      # 画布容器（管理多层 canvas + 事件路由）
+│       │   ├── canvas/
+│       │   │   ├── CanvasRenderer.vue    # 调用 render() 渲染像素
+│       │   │   ├── CanvasGrid.vue        # 缩放 ≥6x 时绘制像素网格线
+│       │   │   ├── TemplateOverlay.vue   # template 可编辑区域遮罩
+│       │   │   ├── ToolPreviewOverlay.vue # 工具实时预览（橡皮筋/虚线框）
+│       │   │   └── SelectionOverlay.vue  # 选中图形高亮 + 控制点
+│       │   ├── StatusBar.vue         # 底部状态栏（坐标/错误/尺寸）
+│       │   ├── ErrorPanel.vue        # 错误列表面板
+│       │   └── panels/              # （二期）
+│       │       ├── PaletteManager.vue
+│       │       └── DefinePanel.vue
+│       ├── stores/
+│       │   └── editorStore.ts       # 全局状态（reactive），注入到全组件树
+│       ├── tools/
+│       │   ├── BaseTool.ts          # 工具基类（抽象接口）
+│       │   ├── SelectTool.ts        # 选择/移动/拖拽
+│       │   ├── RectTool.ts          # 矩形绘制
+│       │   ├── LineTool.ts          # 线条绘制
+│       │   ├── PolyTool.ts          # 多边形绘制（状态机）
+│       │   ├── BitmapTool.ts        # 画笔/像素编辑
+│       │   └── EyedropperTool.ts    # 取色器
+│       └── types.ts                 # Web 侧类型定义（坐标映射、UI 状态等）
+├── vite.config.ts                   # ★ Vite 配置文件
+├── tsconfig.json                    # 调整为 references 模式
+├── tsconfig.cli.json                # CLI 专用 tsconfig
+├── tsconfig.web.json                # Web 专用 tsconfig
+├── package.json                     # 更新 scripts + dependencies
+└── .gitignore
+----
+
+=== 各文件职责
+
+[cols="1,3"]
+|===
+| 文件 | 职责
+| `src/core/index.ts` | DSL 解析（`parseDSL`）、渲染（`render`/`renderDSL`）、AST→代码（`generateDSL`），**零框架依赖**
+| `src/web/main.ts` | `import { createApp } from 'vue'` → `createApp(App).mount('#app')`
+| `src/web/App.vue` | 根组件：Provider 注入 `editorStore`，布局 Header + Toolbar + EditorArea + StatusBar + ErrorPanel
+| `src/web/stores/editorStore.ts` | 全局编辑器状态 `reactive` 对象，包含 dslCode / program / errors / currentTool / undoStack 等
+| `src/web/components/CodeEditor.vue` | 封装 CodeMirror 6 实例，emit `update:value`，接收 `value` prop
+| `src/web/components/CanvasEditor.vue` | 画布交互入口：管理多层 canvas 渲染、鼠标事件路由到当前工具
+| `src/web/tools/BaseTool.ts` | 工具接口定义，所有工具继承此类
+| `vite.config.ts` | Vite 配置：Vue 插件、输入/输出路径、resolve alias
+| `tsconfig.cli.json` | CLI 构建配置，`moduleResolution: "node"`，排除 `src/web`
+| `tsconfig.web.json` | Web 类型检查配置（Vite 本身用 esbuild 编译），用于 IDE 提示
+|===
+
+== 构建配置详解
+
+=== Vite 配置（vite.config.ts）
+
+[source,javascript]
+----
+// vite.config.ts
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+import { resolve } from 'path'
+
+export default defineConfig({
+  plugins: [vue()],
+
+  // 以 src/web/ 为应用根目录（index.html 所在目录）
+  root: resolve(__dirname, 'src/web'),
+
+  // 相对路径引用（确保在子路径下也能加载资源）
+  base: './',
+
+  build: {
+    // 输出到 dist/web/
+    outDir: resolve(__dirname, 'dist/web'),
+    emptyOutDir: true,
+    rollupOptions: {
+      input: resolve(__dirname, 'src/web/index.html'),
+      output: {
+        // 按类型分包
+        chunkFileNames: 'assets/[name]-[hash].js',
+        entryFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
+      },
+    },
+    // 压缩
+    minify: 'esbuild',
+    // 源映射（开发用）
+    sourcemap: true,
+  },
+
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src/web'),
+      '@core': resolve(__dirname, 'src/core'),
+    },
+  },
+
+  server: {
+    port: 3000,
+    open: true,  // 自动打开浏览器
+  },
+})
+----
+
+=== package.json 脚本变更
+
+[source,json]
+----
+{
+  "scripts": {
+    "clean": "rm -rf dist",
+    // ----- Web（主场景）-----
+    "dev": "vite",                           // Vite HMR 开发服务器 :3000
+    "build": "vite build",                   // 构建 Web 到 dist/web/
+    "preview": "vite preview",               // 预览构建产物
+
+    // ----- CLI -----
+    "build:cli": "tsc -p tsconfig.cli.json", // CLI 构建（纯 tsc）
+    "build:web": "vite build",               // 与 build 一致
+
+    // ----- 工具 -----
+    "cli": "node dist/cli/index.js",         // 运行 CLI
+    "test": "npx tsx tests/1001-dsl-to-txt/1001DslToTxt.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.cli.json && tsc --noEmit -p tsconfig.web.json"
+  }
+}
+----
+
+变更要点：
+
+1. `build` 默认构建 Web（主使用场景）
+2. `dev` 使用 Vite 开发服务器（HMR，修改代码即时生效）
+3. CLI 构建使用独立 `tsconfig.cli.json`
+4. `build-web.js` 在 Vite 构建后不再需要（Vite 自动处理资源拷贝和路径）
+5. `typecheck` 分别检查 CLI 和 Web 的类型
+
+=== tsconfig 拆分
+
+[source,json]
+----
+// tsconfig.cli.json — CLI 构建配置（Node.js 环境）
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "node",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/cli/**/*.ts", "src/core/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/web"]
+}
+
+// tsconfig.web.json — Web 类型检查（Vite 用 esbuild 编译，tsconfig 仅供 IDE）
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": false,
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "jsx": "preserve",
+    "types": ["vite/client"]
+  },
+  "include": ["src/web/**/*.ts", "src/web/**/*.vue", "src/core/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+----
+
+注意：Vite 在 dev/build 时会使用 esbuild 自动处理 TypeScript 和 Vue SFC，**Web 构建不需要 tsc 参与**。`tsconfig.web.json` 仅用于 IDE 类型检查和代码提示。
+
+== 组件树与通信机制
+
+=== 组件树（静态结构）
+
+[source]
+----
+App.vue  (provide: editorStore)
+ ├── AppHeader.vue           (inject: editorStore)
+ │    ├── [导出 PNG]
+ │    ├── [撤销]              ← disabled when undoStack empty
+ │    ├── [重做]              ← disabled when redoStack empty
+ │    └── [Define 管理]       (二期)
+ ├── Toolbar.vue             (inject: editorStore)
+ │    ├── 工具按钮组           ← 单选，当前工具高亮
+ │    ├── 颜色选择器           ← 从 palette 动态生成色块
+ │    └── 线条半径滑块         ← v-model: lineRadius
+ ├── EditorArea.vue          (inject: editorStore，纯布局)
+ │    ├── CodeEditor.vue     (props: value, highlightLines; emit: update:value)
+ │    │    └── CodeMirror 6   ← 在 mounted 中初始化
+ │    └── CanvasEditor.vue   (inject: editorStore)
+ │         ├── <canvas ref="renderCanvas">        ← 主渲染
+ │         ├── <canvas ref="gridCanvas">           ← 网格（叠加）
+ │         ├── <canvas ref="templateCanvas">       ← 模板遮罩（叠加）
+ │         ├── <canvas ref="previewCanvas">        ← 工具预览（叠加）
+ │         └── <canvas ref="selectionCanvas">      ← 选中高亮（叠加）
+ ├── StatusBar.vue           (inject: editorStore)
+ │    ├── 鼠标坐标 (x, y)
+ │    ├── 图像尺寸 + template 类型
+ │    └── 错误计数 / 状态信息
+ └── ErrorPanel.vue          (inject: editorStore)
+      └── 错误列表（仅在 errors.length > 0 时显示）
+----
+
+=== 组件通信机制
+
+所有组件通信采用 **provide/inject + 直接写 store** 模式，不引入事件总线：
+
+[source,typescript]
+----
+// App.vue — 根组件提供 editorStore
+import { provide } from 'vue'
+import { editorStore } from './stores/editorStore'
+
+export default defineComponent({
+  setup() {
+    provide('editorStore', editorStore)
+  },
+  // ...
+})
+
+// 任意子组件使用
+export default defineComponent({
+  inject: ['editorStore'],
+  computed: {
+    currentTool() {
+      return this.editorStore.state.currentTool
+    }
+  },
+  methods: {
+    onToolClick(tool: string) {
+      this.editorStore.state.currentTool = tool
+    }
+  }
+})
+----
+
+使用 `provide/inject` 而非 Vuex/Pinia 的理由：
+
+1. 组件树只有两层（App → 子组件），不需要深层的透传
+2. 全局状态只有一份 editorStore，单一职责
+3. editorStore 本身就是响应式（reactive），修改自动触发视图更新
+4. 减少额外依赖
+
+== editorStore 全局状态设计
+
+=== 状态结构
+
+[source,typescript]
+----
+// stores/editorStore.ts
+import { reactive } from 'vue'
+
+export type ToolType = 'select' | 'rect' | 'line' | 'poly' | 'bitmap' | 'eyedropper'
+
+export interface EditorState {
+  // ----- DSL 数据源 -----
+  dslCode: string                    // DSL 源代码
+  program: DSLProgram | null         // 解析后的 AST（单一数据源）
+  errors: DSLError[]                 // 解析错误
+
+  // ----- 工具状态 -----
+  currentTool: ToolType
+  currentColor: string               // 颜色代码 '1'-'9' | 'a'-'z' | 'A'-'Z'
+  lineRadius: number                 // 线条半径 0-5
+  scale: number                      // 画布缩放倍率 1/2/4/8/16
+
+  // ----- 选中状态 -----
+  selectedCommandIndices: number[]   // 选中的命令索引（支持多选）
+  highlightedLineNumbers: number[]   // 代码编辑器高亮的行号
+
+  // ----- 鼠标状态 -----
+  mouseDSLPosition: Point | null     // 鼠标在 DSL 坐标中的位置
+
+  // ----- 撤销/重做 -----
+  undoStack: string[]                // DSL 代码快照历史
+  redoStack: string[]                // 重做栈
+
+  // ----- 工具预览 -----
+  toolPreview: any                   // 当前工具的预览数据
+}
+
+export function createEditorStore() {
+  const state = reactive<EditorState>({
+    dslCode: '',
+    program: null,
+    errors: [],
+    currentTool: 'select',
+    currentColor: '1',
+    lineRadius: 0,
+    scale: 4,
+    selectedCommandIndices: [],
+    highlightedLineNumbers: [],
+    mouseDSLPosition: null,
+    undoStack: [],
+    redoStack: [],
+    toolPreview: null,
+  })
+
+  // ---------- 核心方法 ----------
+
+  /**
+   * 解析 DSL 代码并更新 AST + 渲染
+   * 调用链：用户输入 → CodeMirror emit → 此方法 → 画布更新
+   */
+  function parseAndRender(code: string): void {
+    state.dslCode = code
+
+    if (!code.trim()) {
+      state.program = null
+      state.errors = []
+      return
+    }
+
+    const { program, errors } = parseDSL(code)
+    state.program = program
+    state.errors = errors
+    // CanvasEditor 通过 watch('program') 自动重绘
+  }
+
+  /**
+   * 从 AST 生成 DSL 代码
+   * 调用链：画布绘制/编辑 → AST 修改 → 此方法 → 代码编辑器更新
+   */
+  function syncCodeFromAST(): void {
+    if (!state.program) return
+    const code = generateDSL(state.program)
+    state.dslCode = code
+    // CodeEditor 通过 watch('dslCode') 自动更新编辑器内容
+  }
+
+  /**
+   * 添加新命令（画布绘制完成时调用）
+   */
+  function addCommand(cmd: DrawCommand | UseCmd): void {
+    if (!state.program) return
+    pushSnapshot()
+    state.program.commands.push(cmd)
+    syncCodeFromAST()
+  }
+
+  /**
+   * 修改命令（拖拽/编辑时调用）
+   */
+  function modifyCommand(index: number, cmd: DrawCommand | UseCmd): void {
+    if (!state.program || index < 0 || index >= state.program.commands.length) return
+    pushSnapshot()
+    state.program.commands[index] = cmd
+    syncCodeFromAST()
+  }
+
+  /**
+   * 删除命令
+   */
+  function deleteCommand(index: number): void {
+    if (!state.program) return
+    pushSnapshot()
+    state.program.commands.splice(index, 1)
+    syncCodeFromAST()
+  }
+
+  // ---------- 撤销/重做 ----------
+
+  function pushSnapshot(): void {
+    const current = state.dslCode
+    if (state.undoStack.length > 0 && state.undoStack[state.undoStack.length - 1] === current) return
+    state.undoStack.push(current)
+    if (state.undoStack.length > 100) state.undoStack.shift()
+    state.redoStack = []
+  }
+
+  function undo(): void {
+    if (state.undoStack.length === 0) return
+    state.redoStack.push(state.dslCode)
+    const prev = state.undoStack.pop()!
+    parseAndRender(prev)
+  }
+
+  function redo(): void {
+    if (state.redoStack.length === 0) return
+    state.undoStack.push(state.dslCode)
+    const next = state.redoStack.pop()!
+    parseAndRender(next)
+  }
+
+  return {
+    state,
+    parseAndRender,
+    syncCodeFromAST,
+    addCommand,
+    modifyCommand,
+    deleteCommand,
+    pushSnapshot,
+    undo,
+    redo,
+  }
+}
+
+// 单例导出
+export const editorStore = createEditorStore()
+----
+
+=== 数据流时序（4 种核心场景）
+
+==== 场景 A：用户在代码编辑器中输入
+
+[source]
+----
+用户输入 → CodeMirror 6 updateListener
+  → emit('update:value', newCode)
+  → editorStore.parseAndRender(newCode)
+    → parseDSL(newCode) → { program, errors }
+    → state.program = program
+    → state.errors = errors
+  → CanvasEditor watch('program') fires
+    → 清空叠加层
+    → render(program) → ImageData
+    → putImageData 到 renderCanvas
+    → TemplateOverlay 重绘
+  → StatusBar watch('errors') fires → 更新状态
+  → ErrorPanel watch('errors') fires → 显示/隐藏错误列表
+----
+
+==== 场景 B：用户在画布绘制矩形
+
+[source]
+----
+CanvasEditor: mousedown（记录起点）
+  → 当前工具 RectTool.onPointerDown({ x, y })
+    → state.toolPreview = { start, end }（预览矩形）
+  → ToolPreviewOverlay 响应式重绘（橡皮筋效果）
+
+CanvasEditor: mousemove
+  → RectTool.onPointerMove({ x, y })
+    → state.toolPreview = { start, end }
+
+CanvasEditor: mouseup（终点确定）
+  → RectTool.onPointerUp({ x, y })
+    → 返回 ToolResult { type: 'add', command: RectCmd }
+  → editorStore.addCommand(rectCmd)
+    → pushSnapshot() ← 记录撤销快照
+    → program.commands.push(rectCmd)
+    → generateDSL(program) → newCode
+    → state.dslCode = newCode
+  → CanvasRenderer watch('program') → 重绘
+  → CodeEditor watch('dslCode') → 更新编辑器内容
+  → state.toolPreview = null → 清除预览
+----
+
+==== 场景 C：用户选中图形（画布 → 代码联动）
+
+[source]
+----
+CanvasEditor: click（画布空白区单击）
+  → hitTest(x, y, commands) → 返回命令索引
+  → editorStore.state.selectedCommandIndices = [index]
+  → SelectionOverlay watch('selectedCommandIndices') → 绘制高亮边框 + 控制点
+  → editorStore.state.highlightedLineNumbers = [getLineByCommandIndex(index)]
+  → CodeEditor watch('highlightLineNumbers') → 设置行高亮 + 滚动到对应行
+----
+
+==== 场景 D：用户拖拽移动图形
+
+[source]
+----
+CanvasEditor: mousedown（在选中图形上）
+  → SelectTool.onPointerDown({ x, y })
+    → 记录拖拽起点 + 被拖拽命令的原始坐标
+    → state.toolPreview = { dragStart, dragEnd, highlight }
+
+CanvasEditor: mousemove
+  → SelectTool.onPointerMove({ x, y })
+    → 计算偏移量 → 更新 toolPreview 中的临时坐标
+    → ToolPreviewOverlay 绘制移动中的图形（半透明）
+
+CanvasEditor: mouseup
+  → SelectTool.onPointerUp({ x, y })
+    → 计算最终偏移 → 修改命令坐标
+    → 返回 ToolResult { type: 'modify', commandIndex, command }
+  → editorStore.modifyCommand(index, updatedCmd)
+    → pushSnapshot()
+    → 替换 program.commands[index]
+    → generateDSL(program) → newCode
+    → state.dslCode = newCode
+  → CanvasRenderer 重绘
+  → CodeEditor 更新（保留滚动位置）
+----
+
+== generateDSL() 函数 — 核心新增
+
+=== 接口与实现
+
+[source,typescript]
+----
+// src/core/index.ts 中新增
+
+/**
+ * 将 DSLProgram AST 重新生成为 DSL 源代码字符串
+ *
+ * 与 parseDSL 严格互逆：
+ *   parseDSL(generateDSL(program)) 应得到结构等价的 AST
+ *
+ * @param program - DSL AST
+ * @param options - 生成选项
+ * @returns DSL 源代码（末尾带换行）
+ */
+export function generateDSL(
+  program: DSLProgram
+): string {
+  const lines: string[] = []
+
+  // ----- head -----
+  lines.push(`dsl ${program.header.version}`)
+  lines.push(`size ${program.header.width} ${program.header.height}`)
+  if (program.header.template !== 'none') {
+    lines.push(`template ${program.header.template}`)
+  }
+  lines.push('')
+
+  // ----- palette -----
+  lines.push('palette {')
+  for (const [code, hex] of program.palette) {
+    lines.push(`  ${code} ${hex}`)
+  }
+  lines.push('}')
+  lines.push('')
+
+  // ----- series -----
+  for (const s of program.series) {
+    lines.push(`series ${s.colors.join(' ')}`)
+  }
+  if (program.series.length > 0) lines.push('')
+
+  // ----- defines -----
+  for (const [, def] of program.defines) {
+    lines.push(`define ${def.name} {`)
+    for (const cmd of def.commands) {
+      lines.push(`  ${drawCommandToString(cmd)}`)
+    }
+    lines.push('}')
+    lines.push('')
+  }
+
+  // ----- commands -----
+  for (const cmd of program.commands) {
+    if (cmd.type === 'use') {
+      const transforms = cmd.transforms.length > 0
+        ? ' ' + cmd.transforms.join(' ')
+        : ''
+      lines.push(
+        `use ${cmd.name}${transforms} ${cmd.position.x},${cmd.position.y}`
+      )
+    } else {
+      lines.push(drawCommandToString(cmd))
+    }
+  }
+
+  return lines.join('\n') + '\n'
+}
+
+function drawCommandToString(cmd: DrawCommand): string {
+  switch (cmd.type) {
+    case 'rect':
+      return `rect ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} ${cmd.color}`
+    case 'line':
+      return `line ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} ${cmd.radius} ${cmd.color}`
+    case 'poly':
+      return `poly ${cmd.points.map(p => `${p.x},${p.y}`).join(' ')} ${cmd.color}`
+    case 'bitmap':
+      return `bitmap ${cmd.origin.x},${cmd.origin.y} {\n  ${cmd.rows.join('\n  ')}\n}`
+  }
+}
+----
+
+=== 互逆性保证
+
+|====
+| 特性 | generateDSL 行为 | 备注
+| 注释 | 不保留 | 注释在 parse 时已丢弃
+| 格式 | 标准化（统一缩进为 2 空格）| 与手写风格略有差异，但不影响语义
+| 顺序 | 严格按 DSL 规范 | dsl → size → template → palette → series → define → commands
+| 颜色代码 | 保持原样 | "1" 不会转成数字 "1"
+| bitmap 行 | 每行原样输出 | 仅在行间加换行 + 缩进
+| use 命令 | 变换在前，位置在后 | 统一格式：`use name transforms x,y`
+|====
+
+== Vue 3 Options API 组件规范
+
+所有组件统一使用 Options API，遵循以下约定：
+
+=== 组件骨架
+
+[source,vue]
+----
+<template>
+  <div class="component-name">
+    <!-- 模板内容 -->
+  </div>
+</template>
+
+<script lang="ts">
+import { defineComponent } from 'vue'
+
+export default defineComponent({
+  name: 'ComponentName',
+
+  // Props — 尽可能少，优先使用 inject
+  props: {
+    exampleProp: { type: String, default: '' },
+  },
+
+  // Emits — 子→父通信
+  emits: ['update:value', 'some-event'],
+
+  // 注入 editorStore
+  inject: ['editorStore'],
+
+  // 数据（本地状态）
+  data() {
+    return {
+      localState: null,
+    }
+  },
+
+  // 计算属性（从 store 派生）
+  computed: {
+    computedValue() {
+      return this.editorStore?.state?.someProperty
+    },
+  },
+
+  // 观察（响应副作用）
+  watch: {
+    'editorStore.state.dslCode'(newVal) {
+      // 响应 DSL 代码变化
+    },
+  },
+
+  // 方法
+  methods: {
+    handleClick() {
+      // 事件处理
+    },
+  },
+
+  // 生命周期
+  mounted() {
+    // 初始化
+  },
+  beforeUnmount() {
+    // 清理
+  },
+})
+</script>
+
+<style scoped>
+.component-name {
+  /* Scoped CSS */
+}
+</style>
+----
+
+=== 组件职责边界
+
+|====
+| 组件 | 职责 | 不应做的事
+| App.vue | 布局 + provide store | 业务逻辑
+| AppHeader.vue | 展示标题、操作按钮 | 直接调用 editorStore 以外的方法
+| Toolbar.vue | 展示工具选项，emit 选择事件 | 修改 store（直接 store.state.xxx = yyy）
+| CodeEditor.vue | 封装 CodeMirror 实例 | DSL 解析/渲染
+| CanvasEditor.vue | 管理画布 + 路由事件到工具 | 直接修改 DSL 代码（通过 editorStore 方法）
+| CanvasRenderer.vue | 调用 render() 并 putImageData | 处理鼠标事件
+| 各 Overlay 组件 | 单一叠加层绘制 | 直接访问 store（通过 props 接收数据）
+| StatusBar.vue | 纯展示 | 业务逻辑
+| ErrorPanel.vue | 展示错误列表 | DSL 错误生成
+|====
+
+== 画布分层渲染架构
+
+=== 多层 Canvas 设计
+
+Canvas 编辑器使用 **5 层独立 canvas** 叠加，每层职责单一：
+
+[source]
+----
+CanvasEditor.vue 容器（负责鼠标事件捕获 + 坐标映射）
+  │
+  ├── Layer 1 (最底层): renderCanvas   — 调用 render(program) 绘制像素
+  │     每当 program 变化时重绘
+  │     缩放由 ctx.drawImage(tmp, 0, 0, w*scale, h*scale) 实现
+  │
+  ├── Layer 2: gridCanvas              — 像素网格线
+  │     仅在 scale ≥ 6 时绘制
+  │     线条颜色 #333，线宽 0.5px
+  │
+  ├── Layer 3: templateCanvas          — Template 遮罩
+  │     半透明 #000 覆盖非可编辑区域
+  │     白色虚线标记可编辑区域边界
+  │
+  ├── Layer 4: selectionCanvas         — 选中图形高亮
+  │     选中图形外发光（黄色虚线边框）
+  │     控制点（白色方块，6×6 px）
+  │
+  └── Layer 5 (最顶层): previewCanvas  — 工具实时预览
+       矩形橡皮筋（白色虚线）
+       线条/多边形预览（半透明实线）
+       拖拽移动预览（半透明图形）
+----
+
+=== 坐标映射
+
+[source,typescript]
+----
+// CanvasEditor.vue
+methods: {
+  /**
+   * 鼠标事件 → DSL 逻辑坐标
+   */
+  mouseEventToDSL(event: MouseEvent): Point {
+    const canvas = this.$refs.renderCanvas as HTMLCanvasElement
+    const rect = canvas.getBoundingClientRect()
+    return {
+      x: Math.floor((event.clientX - rect.left) / this.editorStore.state.scale),
+      y: Math.floor((event.clientY - rect.top) / this.editorStore.state.scale),
+    }
+  },
+
+  /**
+   * DSL 逻辑坐标 → 画布像素坐标
+   */
+  dslToCanvas(dslX: number, dslY: number): { x: number; y: number } {
+    const scale = this.editorStore.state.scale
+    return { x: dslX * scale, y: dslY * scale }
+  },
+
+  /**
+   * 路由鼠标事件到当前工具
+   */
+  handlePointerDown(event: PointerEvent) {
+    const dslPos = this.mouseEventToDSL(event)
+    const toolEvent = {
+      x: dslPos.x,
+      y: dslPos.y,
+      button: event.button as 0 | 2,
+      shiftKey: event.shiftKey,
+      ctrlKey: event.ctrlKey,
+    }
+    const ctx = this.getToolContext()
+    const result = this.currentToolInstance.onPointerDown(toolEvent, ctx)
+    this.applyToolResult(result)
+  },
+}
+----
+
+=== 图形命中检测
+
+[source,typescript]
+----
+/**
+ * 从后往前遍历命令，判断鼠标点击属于哪个图形
+ */
+function hitTest(
+  dslX: number,
+  dslY: number,
+  commands: (DrawCommand | UseCmd)[]
+): number {
+  for (let i = commands.length - 1; i >= 0; i--) {
+    const cmd = commands[i]
+    if (cmd.type === 'use') continue  // 二期支持 use 展开
+
+    switch (cmd.type) {
+      case 'rect': {
+        const x1 = Math.min(cmd.p1.x, cmd.p2.x)
+        const y1 = Math.min(cmd.p1.y, cmd.p2.y)
+        const x2 = Math.max(cmd.p1.x, cmd.p2.x)
+        const y2 = Math.max(cmd.p1.y, cmd.p2.y)
+        if (dslX >= x1 && dslX <= x2 && dslY >= y1 && dslY <= y2) return i
+        break
+      }
+      case 'line': {
+        const dist = pointToSegmentDist(dslX, dslY, cmd.p1, cmd.p2)
+        if (dist <= cmd.radius + 1) return i
+        break
+      }
+      case 'poly': {
+        if (pointInPolygon(dslX, dslY, cmd.points)) return i
+        break
+      }
+      case 'bitmap': {
+        const col = dslX - cmd.origin.x
+        const row = dslY - cmd.origin.y
+        if (
+          row >= 0 && row < cmd.rows.length &&
+          col >= 0 && col < cmd.rows[row].length &&
+          cmd.rows[row][col] !== '0'
+        ) return i
+        break
+      }
+    }
+  }
+  return -1
+}
+----
+
+== 工具系统设计
+
+=== BaseTool 接口
+
+[source,typescript]
+----
+// tools/BaseTool.ts
+import type { DrawCommand, DSLProgram } from '@core/index.js'
+
+/** 工具事件（由鼠标事件转换而来）*/
+export interface ToolEvent {
+  x: number          // DSL 逻辑坐标
+  y: number
+  button: 0 | 2      // 0=左键, 2=右键
+  shiftKey: boolean
+  ctrlKey: boolean
+}
+
+/** 工具上下文（来自 editorStore 的快照）*/
+export interface ToolContext {
+  program: DSLProgram | null
+  currentColor: string
+  lineRadius: number
+  scale: number
+}
+
+/** 工具操作结果 */
+export interface ToolResult {
+  type: 'add' | 'modify' | 'delete' | 'select' | 'none'
+  commandIndex?: number
+  command?: DrawCommand
+  selectedIndices?: number[]
+  /** 需要更新预览的数据 */
+  preview?: any
+}
+
+export abstract class BaseTool {
+  /** 工具名称标识 */
+  abstract readonly name: string
+
+  /** 鼠标按下 */
+  abstract onPointerDown(event: ToolEvent, ctx: ToolContext): ToolResult | null
+
+  /** 鼠标移动（拖拽中） */
+  abstract onPointerMove(event: ToolEvent, ctx: ToolContext): ToolResult | null
+
+  /** 鼠标松开 */
+  abstract onPointerUp(event: ToolEvent, ctx: ToolContext): ToolResult | null
+
+  /** 双击（多边形闭合） */
+  onDoubleClick?(event: ToolEvent, ctx: ToolContext): ToolResult | null
+
+  /** 键盘事件 */
+  onKeyDown?(key: string, ctx: ToolContext): ToolResult | null
+
+  /** 重置工具内部状态 */
+  abstract reset(): void
+}
+----
+
+=== 各工具核心逻辑
+
+==== SelectTool（选择/移动）
+
+[source,typescript]
+----
+class SelectTool extends BaseTool {
+  name = 'select'
+  private dragStart: Point | null = null
+  private dragCommandIndex: number = -1
+  private dragOriginalCommand: DrawCommand | null = null
+
+  onPointerDown(event: ToolEvent, ctx: ToolContext) {
+    const index = hitTest(event.x, event.y, ctx.program?.commands ?? [])
+    if (index >= 0) {
+      // 命中图形 → 进入拖拽模式
+      this.dragStart = { x: event.x, y: event.y }
+      this.dragCommandIndex = index
+      this.dragOriginalCommand = { ...ctx.program!.commands[index] } as DrawCommand
+      return { type: 'select', selectedIndices: [index] }
+    }
+    // 未命中 → 取消选中
+    this.reset()
+    return { type: 'select', selectedIndices: [] }
+  }
+
+  onPointerMove(event: ToolEvent, ctx: ToolContext) {
+    if (!this.dragStart) return null
+    // 返回预览数据（CanvasEditor 用来绘制移动中预览）
+    const offsetX = event.x - this.dragStart.x
+    const offsetY = event.y - this.dragStart.y
+    return { type: 'none', preview: { dragCommandIndex: this.dragCommandIndex, offsetX, offsetY } }
+  }
+
+  onPointerUp(event: ToolEvent, ctx: ToolContext) {
+    if (!this.dragStart || this.dragCommandIndex < 0) return null
+    const offsetX = event.x - this.dragStart.x
+    const offsetY = event.y - this.dragStart.y
+    if (offsetX === 0 && offsetY === 0) {
+      this.reset()
+      return null  // 没有拖拽 → 仅选中
+    }
+    // 修改命令坐标
+    const cmd = this.dragOriginalCommand!
+    const newCmd = offsetCommand(cmd, offsetX, offsetY)
+    this.reset()
+    return { type: 'modify', commandIndex: this.dragCommandIndex, command: newCmd }
+  }
+
+  onKeyDown(key: string, ctx: ToolContext) {
+    if (key === 'Delete' || key === 'Backspace') {
+      // 删除选中图形由 editorStore 处理，这里返回提示
+      return { type: 'delete', commandIndex: ctx.program?.commands.length ?? -1 }
+    }
+    return null
+  }
+
+  reset() {
+    this.dragStart = null
+    this.dragCommandIndex = -1
+    this.dragOriginalCommand = null
+  }
+}
+----
+
+==== RectTool（矩形绘制）
+
+[source,typescript]
+----
+class RectTool extends BaseTool {
+  name = 'rect'
+  private startPoint: Point | null = null
+
+  onPointerDown(event: ToolEvent, ctx: ToolContext) {
+    if (event.button !== 0) return null
+    this.startPoint = { x: event.x, y: event.y }
+    return { type: 'none', preview: { start: this.startPoint, end: this.startPoint } }
+  }
+
+  onPointerMove(event: ToolEvent, ctx: ToolContext) {
+    if (!this.startPoint) return null
+    return { type: 'none', preview: { start: this.startPoint, end: { x: event.x, y: event.y } } }
+  }
+
+  onPointerUp(event: ToolEvent, ctx: ToolContext) {
+    if (!this.startPoint) return null
+    const rect: RectCmd = {
+      type: 'rect',
+      p1: { x: this.startPoint.x, y: this.startPoint.y },
+      p2: { x: event.x, y: event.y },
+      color: ctx.currentColor,
+    }
+    this.reset()
+    return { type: 'add', command: rect }
+  }
+
+  reset() { this.startPoint = null }
+}
+----
+
+==== PolyTool（多边形绘制 — 状态机）
+
+[source,typescript]
+----
+/**
+ * 多边形绘制状态机：
+ *
+ *   idle → drawing (mousedown 第一个点)
+ *   drawing → drawing (mousedown 更多点)
+ *   drawing → closed (双击 / 右键 / 在起点附近点击)
+ *   closed → idle (reset)
+ */
+class PolyTool extends BaseTool {
+  name = 'poly'
+  private points: Point[] = []
+
+  onPointerDown(event: ToolEvent, ctx: ToolContext) {
+    if (event.button === 2) {
+      // 右键闭合多边形
+      return this.closePolygon(ctx)
+    }
+    this.points.push({ x: event.x, y: event.y })
+    return { type: 'none', preview: { points: [...this.points] } }
+  }
+
+  onDoubleClick(event: ToolEvent, ctx: ToolContext) {
+    return this.closePolygon(ctx)
+  }
+
+  onPointerMove(event: ToolEvent, ctx: ToolContext) {
+    if (this.points.length === 0) return null
+    return { type: 'none', preview: { points: [...this.points], cursor: { x: event.x, y: event.y } } }
+  }
+
+  private closePolygon(ctx: ToolContext): ToolResult | null {
+    if (this.points.length < 3) return null
+    const poly: PolyCmd = {
+      type: 'poly',
+      points: [...this.points],
+      color: ctx.currentColor,
+    }
+    this.reset()
+    return { type: 'add', command: poly }
+  }
+
+  reset() { this.points = [] }
+}
+----
+
+==== BitmapTool（画笔/像素编辑）
+
+[source,typescript]
+----
+class BitmapTool extends BaseTool {
+  name = 'bitmap'
+  private paintedPixels: Set<string> = new Set()  // "x,y" → color
+  private origin: Point | null = null
+  private isErasing = false
+
+  onPointerDown(event: ToolEvent, ctx: ToolContext) {
+    this.isErasing = event.button === 2
+    this.origin = { x: event.x, y: event.y }
+    this.paintedPixels.add(`${event.x},${event.y}`)
+    return { type: 'none', preview: { pixels: [...this.paintedPixels], color: this.isErasing ? '0' : ctx.currentColor } }
+  }
+
+  onPointerMove(event: ToolEvent, ctx: ToolContext) {
+    if (!this.origin) return null
+    this.paintedPixels.add(`${event.x},${event.y}`)
+    return { type: 'none', preview: { pixels: [...this.paintedPixels], color: this.isErasing ? '0' : ctx.currentColor } }
+  }
+
+  onPointerUp(event: ToolEvent, ctx: ToolContext) {
+    if (!this.origin) return null
+    const bitmap = this.pixelsToBitmap(this.paintedPixels, this.origin, ctx.currentColor)
+    this.reset()
+    return { type: 'add', command: bitmap }
+  }
+
+  private pixelsToBitmap(pixels: Set<string>, origin: Point, color: string): BitmapCmd {
+    // 计算包围盒
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const key of pixels) {
+      const [x, y] = key.split(',').map(Number)
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+    }
+    const cols = maxX - minX + 1
+    const rows = maxY - minY + 1
+    const grid: string[][] = Array.from({ length: rows }, () => Array(cols).fill('0'))
+    for (const key of pixels) {
+      const [x, y] = key.split(',').map(Number)
+      grid[y - minY][x - minX] = color
+    }
+    return {
+      type: 'bitmap',
+      origin: { x: minX, y: minY },
+      rows: grid.map(row => row.join('')),
+    }
+  }
+
+  reset() {
+    this.paintedPixels.clear()
+    this.origin = null
+  }
+}
+----
+
+==== EyedropperTool（取色器）
+
+[source,typescript]
+----
+class EyedropperTool extends BaseTool {
+  name = 'eyedropper'
+
+  onPointerDown(event: ToolEvent, ctx: ToolContext) {
+    if (!ctx.program) return null
+    const index = hitTest(event.x, event.y, ctx.program.commands)
+    if (index < 0) return null
+    const cmd = ctx.program.commands[index]
+    // 查找命令使用的颜色
+    const color = extractColorFromCommand(cmd)
+    if (color) {
+      return { type: 'select', selectedIndices: [index], preview: { pickedColor: color } }
+    }
+    return null
+  }
+
+  onPointerMove() { return null }
+  onPointerUp() { return null }
+  reset() {}
+}
+
+function extractColorFromCommand(cmd: DrawCommand | UseCmd): string | null {
+  switch (cmd.type) {
+    case 'rect': return cmd.color
+    case 'line': return cmd.color
+    case 'poly': return cmd.color
+    // bitmap 可能有多种颜色，返回第一个非透明颜色
+    case 'bitmap': {
+      for (const row of cmd.rows) {
+        for (const ch of row) {
+          if (ch !== '0') return ch
+        }
+      }
+      return null
+    }
+    default: return null
+  }
+}
+----
+
+== CodeMirror 6 集成
+
+=== 初始化与生命周期
+
+[source,vue]
+----
+<!-- CodeEditor.vue -->
+<template>
+  <div ref="editorContainer" class="code-editor"></div>
+</template>
+
+<script lang="ts">
+import { defineComponent } from 'vue'
+import { EditorView, keymap } from '@codemirror/view'
+import { EditorState } from '@codemirror/state'
+import { defaultHighlightStyle, syntaxHighlighting } from '@codemirror/language'
+import { history, redo, undo } from '@codemirror/commands'
+
+export default defineComponent({
+  name: 'CodeEditor',
+  props: {
+    value: { type: String, required: true },
+    highlightLines: { type: Array as () => number[], default: () => [] },
+    readonly: { type: Boolean, default: false },
+  },
+  emits: ['update:value', 'cursor-changed'],
+  inject: ['editorStore'],
+
+  data() {
+    return {
+      view: null as EditorView | null,
+      isInternalChange: false,  // 防止循环
+    }
+  },
+
+  computed: {
+    extensions() {
+      return [
+        // 自定义 DSL 语法高亮
+        this.dslLanguage(),
+        syntaxHighlighting(defaultHighlightStyle),
+        // 快捷键
+        keymap.of([
+          { key: 'Mod-z', run: undo },
+          { key: 'Mod-Shift-z', run: redo },
+          { key: 'Tab', run: () => this.insertTab() },
+        ]),
+        // 更新监听
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            this.isInternalChange = true
+            this.$emit('update:value', update.state.doc.toString())
+            this.$nextTick(() => { this.isInternalChange = false })
+          }
+          if (update.selectionSet) {
+            this.emitCursorPosition(update)
+          }
+        }),
+        // 只读
+        EditorView.editable.of(!this.readonly),
+      ]
+    },
+  },
+
+  methods: {
+    dslLanguage() {
+      // 返回 StreamLanguage 定义（见下文）
+    },
+    insertTab(): boolean {
+      if (!this.view) return false
+      this.view.dispatch({
+        changes: { from: this.view.state.selection.main.head, insert: '  ' },
+      })
+      return true
+    },
+    emitCursorPosition(update: any) {
+      const pos = update.state.selection.main.head
+      const line = update.state.doc.lineAt(pos)
+      this.$emit('cursor-changed', line.number, pos - line.from + 1)
+    },
+    setEditorValue(code: string) {
+      if (!this.view) return
+      const current = this.view.state.doc.toString()
+      if (code !== current) {
+        this.view.dispatch({
+          changes: { from: 0, to: current.length, insert: code },
+        })
+      }
+    },
+    updateHighlights(lines: number[]) {
+      // 设置行高亮 decoration
+      if (lines.length > 0 && this.view) {
+        const line = this.view.state.doc.line(lines[0])
+        this.view.dispatch({
+          effects: EditorView.scrollIntoView(line.from, { y: 'center' }),
+        })
+      }
+    },
+  },
+
+  watch: {
+    value(newVal) {
+      if (!this.isInternalChange) {
+        this.setEditorValue(newVal)
+      }
+    },
+    highlightLines(lines) {
+      this.updateHighlights(lines)
+    },
+  },
+
+  mounted() {
+    const startState = EditorState.create({
+      doc: this.value,
+      extensions: this.extensions,
+    })
+    this.view = new EditorView({
+      state: startState,
+      parent: this.$refs.editorContainer as HTMLElement,
+    })
+  },
+
+  beforeUnmount() {
+    this.view?.destroy()
+  },
+})
+</script>
+
+<style scoped>
+.code-editor {
+  height: 100%;
+  overflow: hidden;
+}
+.code-editor :deep(.cm-editor) {
+  height: 100%;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 14px;
+}
+.code-editor :deep(.cm-scroller) {
+  overflow: auto;
+}
+</style>
+----
+
+=== DSL 语法高亮定义
+
+[source,typescript]
+----
+// CodeEditor 组件内部：dsl-language.ts
+import { StreamLanguage } from '@codemirror/language'
+
+export const dslLanguage = () => StreamLanguage.define({
+  token(stream) {
+    // 注释
+    if (stream.match(/^\/\/.*/)) return 'comment'
+
+    // 空白
+    if (stream.eatSpace()) return null
+
+    // DSL 关键字（命令 + 声明）
+    if (stream.match(
+      /^(dsl|size|template|palette|series|define|use|rect|line|poly|bitmap)\b/
+    )) return 'keyword'
+
+    // 变换关键字
+    if (stream.match(/^(fx|fy|r90|r180|r270)\b/)) return 'keyword'
+
+    // 十六进制颜色 #RRGGBB
+    if (stream.match(/^#[0-9a-fA-F]{6}/)) return 'color'
+
+    // 数字（整数）
+    if (stream.match(/^-?\d+/)) return 'number'
+
+    // 单字符颜色代码（1-9, a-z, A-Z）
+    if (stream.match(/^[0-9a-zA-Z]/)) return 'atom'
+
+    // 花括号 / 逗号
+    if (stream.match(/^[{}|,]/)) return 'punctuation'
+
+    // 其他
+    stream.next()
+    return null
+  },
+  languageData: {
+    commentTokens: { line: '//' },
+  },
+})
+----
+
+== Template 可编辑区域可视化
+
+=== 区域计算
+
+[source,typescript]
+----
+// stores/useTemplateRegion.ts（独立工具函数，非 composable）
+export interface RegionInfo {
+  isDrawable: (x: number, y: number) => boolean
+  drawableBoundary: Point[]   // 可编辑区域边界（用于绘制边界线）
+  maskRegions: MaskRegion[]   // 需要遮罩的区域
+}
+
+export interface MaskRegion {
+  type: 'rect' | 'polygon'
+  points: Point[]   // 遮罩区域顶点
+}
+
+export function getTemplateRegion(header: DSLHeader): RegionInfo {
+  const halfW = Math.floor(header.width / 2)
+  const halfH = Math.floor(header.height / 2)
+
+  switch (header.template) {
+    case 'none':
+      return {
+        isDrawable: () => true,
+        drawableBoundary: [],
+        maskRegions: [],
+      }
+
+    case 'unit':
+    case 'turret':
+      return {
+        isDrawable: (x) => x < halfW,
+        drawableBoundary: [
+          { x: halfW, y: 0 },
+          { x: halfW, y: header.height - 1 },
+        ],
+        maskRegions: [{
+          type: 'rect',
+          points: [
+            { x: halfW, y: 0 },
+            { x: header.width, y: 0 },
+            { x: header.width, y: header.height },
+            { x: halfW, y: header.height },
+          ],
+        }],
+      }
+
+    case 'block':
+      return {
+        isDrawable: (x, y) => y < halfH && x + y < header.width,
+        drawableBoundary: [
+          { x: 0, y: 0 },
+          { x: header.width - 1, y: 0 },
+          { x: halfW, y: halfH },
+        ],
+        maskRegions: [{
+          // 三角形外部 = 整个矩形减去三角形
+          type: 'polygon',
+          points: [
+            { x: 0, y: 0 },
+            { x: header.width, y: 0 },
+            { x: header.width, y: header.height },
+            { x: 0, y: header.height },
+            { x: 0, y: 0 },
+            { x: halfW, y: halfH },
+            { x: header.width, y: 0 },
+          ],
+        }],
+      }
+  }
+}
+----
+
+=== TemplateOverlay.vue 渲染
+
+[source,vue]
+----
+<!-- canvas/TemplateOverlay.vue -->
+<template>
+  <canvas
+    ref="overlayCanvas"
+    :width="canvasWidth"
+    :height="canvasHeight"
+    class="template-overlay"
+  ></canvas>
+</template>
+
+<script lang="ts">
+import { defineComponent } from 'vue'
+import { getTemplateRegion } from '../../stores/useTemplateRegion'
+
+export default defineComponent({
+  name: 'TemplateOverlay',
+  props: {
+    header: { type: Object, required: true },
+    scale: { type: Number, required: true },
+  },
+  inject: ['editorStore'],
+
+  computed: {
+    canvasWidth() {
+      return this.header.width * this.scale
+    },
+    canvasHeight() {
+      return this.header.height * this.scale
+    },
+    regionInfo() {
+      return getTemplateRegion(this.header)
+    },
+  },
+
+  watch: {
+    header: { handler: 'draw', deep: true },
+    scale: 'draw',
+  },
+
+  methods: {
+    draw() {
+      const canvas = this.$refs.overlayCanvas as HTMLCanvasElement
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      const scale = this.scale
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+      // 1. 绘制半透明遮罩
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.4)'
+      for (const region of this.regionInfo.maskRegions) {
+        ctx.beginPath()
+        ctx.moveTo(region.points[0].x * scale, region.points[0].y * scale)
+        for (let i = 1; i < region.points.length; i++) {
+          ctx.lineTo(region.points[i].x * scale, region.points[i].y * scale)
+        }
+        ctx.closePath()
+        ctx.fill()
+      }
+
+      // 2. 绘制可编辑区域边界（白色虚线）
+      if (this.regionInfo.drawableBoundary.length > 0) {
+        ctx.strokeStyle = '#ffffff'
+        ctx.lineWidth = 2
+        ctx.setLineDash([6, 4])
+        ctx.beginPath()
+        ctx.moveTo(
+          this.regionInfo.drawableBoundary[0].x * scale,
+          this.regionInfo.drawableBoundary[0].y * scale
+        )
+        for (let i = 1; i < this.regionInfo.drawableBoundary.length; i++) {
+          ctx.lineTo(
+            this.regionInfo.drawableBoundary[i].x * scale,
+            this.regionInfo.drawableBoundary[i].y * scale
+          )
+        }
+        ctx.stroke()
+        ctx.setLineDash([])
+      }
+
+      // 3. 添加提示文字
+      if (this.regionInfo.drawableBoundary.length > 0) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.7)'
+        ctx.font = `${12 * Math.min(1, scale / 4)}px sans-serif`
+        if (this.header.template === 'block') {
+          ctx.fillText('★ 可编辑区域（三角形）', 4, 14)
+        } else {
+          ctx.fillText('★ 可编辑区域（左侧）', 4, 14)
+        }
+      }
+    },
+  },
+
+  mounted() { this.draw() },
+})
+</script>
+
+<style scoped>
+.template-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;  /* 不拦截鼠标事件 */
+}
+</style>
+----
+
+== 撤销/重做机制
+
+=== 设计原则
+
+- 基于 **DSL 文本快照**（而非 AST 快照）
+- 快照在每次"用户操作完成"时记录
+- 最大保留 100 步历史
+
+=== 触发时机
+
+|====
+| 操作 | 触发时机 | 记录内容
+| 文本编辑（CodeMirror）| debounce 300ms 后 | 当前 DSL 代码
+| 矩形绘制完成 | mouseup | 添加 rect 命令后的 DSL 代码
+| 线条绘制完成 | mouseup | 添加 line 命令后的 DSL 代码
+| 多边形闭合 | 双击/右键 | 添加 poly 命令后的 DSL 代码
+| 画笔绘制完成 | mouseup | 添加 bitmap 命令后的 DSL 代码
+| 图形拖拽移动 | mouseup | 坐标修改后的 DSL 代码
+| 删除图形 | Delete 键 | 删除后的 DSL 代码
+|====
+
+=== 实现
+
+撤销/重做已在 [editorStore](#editorstore-全局状态设计) 中实现，核心逻辑：
+
+[source,typescript]
+----
+function pushSnapshot(): void {
+  const current = state.dslCode
+  // 避免重复记录相同状态
+  if (state.undoStack.length > 0 && state.undoStack[state.undoStack.length - 1] === current) return
+  state.undoStack.push(current)
+  if (state.undoStack.length > 100) state.undoStack.shift()
+  state.redoStack = []  // 新操作清空重做栈
+}
+
+function undo(): void {
+  if (state.undoStack.length === 0) return
+  state.redoStack.push(state.dslCode)
+  const prev = state.undoStack.pop()!
+  parseAndRender(prev)
+}
+
+function redo(): void {
+  if (state.redoStack.length === 0) return
+  state.undoStack.push(state.dslCode)
+  const next = state.redoStack.pop()!
+  parseAndRender(next)
+}
+----
+
+文本快照方案 vs AST 快照方案：
+
+[cols="1,2,2"]
+|===
+| 维度 | 文本快照（选用） | AST 快照（放弃）
+| 内存占用 | 每个快照为字符串，128×128 文件约 1-2KB，100 步约 200KB | 每个快照为 AST 对象，可能达数十 KB
+| 实现复杂度 | 极低：push/pop 字符串 | 需要深拷贝 DSLProgram（含 Map、嵌套对象）
+| 互逆性 | `parseDSL(generateDSL(program))` 保证 | 直接操作 AST，需保证一致性
+| 性能 | 仅记录文本，parse 在恢复时执行一次 | 需深拷贝，但恢复时不需 re-parse
+|===
+
+== 快捷键一览
+
+[cols="1,3,2"]
+|====
+| 快捷键 | 功能 | 作用域
+| `V` | 选择/移动工具 | 全局（非输入框聚焦时）
+| `R` | 矩形工具 | 全局
+| `L` | 线条工具 | 全局
+| `P` | 多边形工具 | 全局
+| `B` | 画笔工具 | 全局
+| `I` | 取色器 | 全局
+| `Ctrl+Z` | 撤销 | 全局
+| `Ctrl+Shift+Z` | 重做 | 全局
+| `Delete` / `Backspace` | 删除选中图形 | 画布聚焦时
+| `Ctrl+S` | 导出 PNG | 全局
+| `Escape` | 取消选中 / 取消绘制 | 全局
+| `Tab` | 插入 2 空格缩进 | 代码编辑器聚焦时
+| `Shift+点击` | 多选图形 | 画布聚焦时
+| `Ctrl+拖拽` | 吸附到网格 | 画布拖拽中
+|====
+
+快捷键在 `App.vue` 中通过全局 `keydown` 事件监听，工具快捷键由 `useKeyboard` 处理：
+
+[source,typescript]
+--------------
+// composables/useKeyboard.ts
+export function useKeyboard(editorStore: any) {
+  function onKeyDown(event: KeyboardEvent) {
+    // 如果焦点在 CodeMirror 中，不处理全局快捷键（除非 Ctrl+）
+    if (isCodeMirrorFocused() && !event.ctrlKey && !event.metaKey) return
+
+    const toolMap: Record<string, ToolType> = {
+      'v': 'select', 'V': 'select',
+      'r': 'rect',   'R': 'rect',
+      'l': 'line',   'L': 'line',
+      'p': 'poly',   'P': 'poly',
+      'b': 'bitmap', 'B': 'bitmap',
+      'i': 'eyedropper', 'I': 'eyedropper',
+    }
+
+    if (toolMap[event.key]) {
+      editorStore.state.currentTool = toolMap[event.key]
+      event.preventDefault()
+      return
+    }
+
+    if (event.key === 'Escape') {
+      editorStore.state.selectedCommandIndices = []
+      // 通知当前工具 reset
+      event.preventDefault()
+    }
+  }
+
+  return { onKeyDown }
+}
+
+--------------
+
+== 工程风险与应对
+
+[cols="1,2,3"]
+|===
+| 风险 | 场景 | 应对方案
+| 频繁 parse/render 卡顿 | 用户快速输入 DSL 文本 | debounce 150ms；CodeMirror 的 updateListener 本身是增量更新
+| 拖拽中全量 generateDSL | 拖拽移动图形 | 拖拽中仅更新 canvas（预览层），mouseup 后再同步到代码
+| 大画布渲染慢 | 256×256 以上大图 | render() 本身 O(N) 复杂度（N=像素数），256×256=65536 像素，实测 <5ms；超过 512×512 考虑 Web Worker
+| bitmap 大块编辑性能 | 画笔模式绘制大面积 | 限制 bitmap 包围盒最大值（建议 ≤64×64）；CodeMirror 6 虚拟滚动不影响
+| Vue 响应式深层对象 | Map 类型（palette/defines）不是 reactive 的 | 直接替换整个 Map；不做深层响应
+| 代码编辑器和画布相互更新循环 | 文本编辑 → AST → 代码同步 → 文本编辑 | 通过 isInternalChange 标志位防止循环
+| build-web.js 废弃后 CI 需更新 | 构建脚本 | `npm run build` 直接调 `vite build`，废弃的 build-web.js 保留但不再使用
+|===
+
+== 开发计划
+
+=== Sprint 1：工程框架搭建（预计 1 天）
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 1.1 | 安装依赖：vue 3、vite 5、@vitejs/plugin-vue、codemirror 6 | package.json 更新
+| 1.2 | 创建 vite.config.ts、tsconfig.cli.json、tsconfig.web.json | 构建配置就绪
+| 1.3 | 创建目录结构：stores/、tools/、components/canvas/、composables/ | 目录就绪
+| 1.4 | 实现 main.ts + App.vue（布局骨架：Header/Toolbar/EditorArea/StatusBar）| Vue 应用可启动
+| 1.5 | 实现 editorStore.ts（基础状态 + parseAndRender）| 状态管理就绪
+| 1.6 | 在 core/index.ts 中实现 generateDSL() | 核心函数
+| 1.7 | 实现 index.html（简化，仅挂载点 `#app`）| 入口 HTML
+| 1.8 | 验证 `npm run dev` 可启动 | 开发环境可用
+|===
+
+=== Sprint 2：代码编辑器 + 画布渲染（预计 1 天）
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 2.1 | 实现 CodeEditor.vue（CodeMirror 6 封装 + DSL 语法高亮）| 代码编辑器可用（语法高亮 + 基本编辑）
+| 2.2 | 实现 CanvasRenderer.vue（从 editorStore 读取 program，调用 render()，putImageData）| 画布实时预览
+| 2.3 | 实现 EditorArea.vue（左右分栏布局 + 拖拽调整宽度）| 分栏布局
+| 2.4 | 实现 Toolbar.vue（工具按钮 + 颜色选择 + 半径滑块）| 工具栏
+| 2.5 | 实现 StatusBar.vue（鼠标坐标 + 尺寸 + 状态）| 状态栏
+| 2.6 | 实现坐标映射（mouseEventToDSL）| 交互基础
+|===
+
+=== Sprint 3：绘制工具（预计 2 天）
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 3.1 | 实现 BaseTool 基类 + RectTool | 矩形绘制
+| 3.2 | 实现 ToolPreviewOverlay.vue（橡皮筋预览）| 实时预览
+| 3.3 | 实现 LineTool + 半径控制 | 线条绘制
+| 3.4 | 实现 PolyTool（绘制状态机 + 双击闭合 + 右键闭合）| 多边形绘制
+| 3.5 | 实现 BitmapTool + 像素编辑 | 画笔绘制
+| 3.6 | 实现 CanvasGrid.vue（缩放 ≥6x 时显示网格）| 像素网格
+|===
+
+=== Sprint 4：交互增强 + 联动（预计 1.5 天）
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 4.1 | 实现 SelectTool + 命中检测 + 高亮 | 图形选择
+| 4.2 | 实现 SelectionOverlay.vue（高亮边框 + 控制点）| 选中可视化
+| 4.3 | 实现拖拽移动 + 代码同步 | 拖拽功能
+| 4.4 | 实现撤销/重做（editorStore 中已设计，连接到 AppHeader 按钮和 Ctrl+Z）| 操作历史
+| 4.5 | 实现代码 ↔ 画布联动高亮（选中图形 → 代码滚动高亮；点击代码行 → 画布高亮）| 双向联动
+|===
+
+=== Sprint 5：Template + 取色器 + 收尾（预计 1 天）
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 5.1 | 实现 TemplateOverlay.vue（可编辑区域遮罩 + 边界线）| template 可视化
+| 5.2 | 工具绘制时约束在可编辑区域内 | 区域外绘制拦截
+| 5.3 | 实现 EyedropperTool（取色后自动切回上一个工具）| 取色器
+| 5.4 | 实现快捷键系统（useKeyboard composable）| 快捷键可用
+| 5.5 | 实现 ErrorPanel.vue + 错误状态展示 | 错误展示
+| 5.6 | 实现导出 PNG（复用现有 exportPNG 逻辑）| 导出功能
+| 5.7 | 整体打磨：暗色主题、CSS 细节、响应式布局 | 可用版本
+|===
+
+=== 二期
+
+[cols="1,3,2"]
+|===
+| # | 任务 | 产出
+| 6.1 | PaletteManager.vue（调色板增删改 + 实时生效）| 调色板编辑
+| 6.2 | DefinePanel.vue（define 列表 + 进入 define 编辑模式时将主图缩小到角落）| define 管理
+| 6.3 | define 编辑器界面设计：主图缩至右上角，编辑区显示 define 内容，保存后恢复 | 编辑体验
+| 6.4 | 拖拽 define 到画布生成 use 命令 | use 生成
+| 6.5 | 变换配置面板（在 use 命令上点击显示变换选项）| 变换交互
+| 6.6 | 选中 use 命令时在画布上显示（展开原始图形 + 预览变换效果）| use 可视化
+|===

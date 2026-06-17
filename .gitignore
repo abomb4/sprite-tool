@@ -1,7 +1,7 @@
 node_modules/
-dist/core/
-dist/cli/
+dist/
 tests/*/out/
 *.js.map
 .DS_Store
 Thumbs.db
+/*.png

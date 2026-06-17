@@ -363,9 +363,15 @@ class Parser {
         this.skipNewlines();
         const rows = [];
         while (this.peek() && this.peek().type !== "rbrace") {
-            const tok = this.advance();
-            if (tok.type === "color") {
-                rows.push(tok.value);
+            // Accumulate all non-newline, non-rbrace tokens into one row string.
+            // In bitmap context, both color tokens ("0"-"9") and number tokens ("11", "16")
+            // represent pixel codes — each character in the token value is one pixel.
+            let row = "";
+            while (this.peek() && this.peek().type !== "newline" && this.peek().type !== "rbrace") {
+                row += this.advance().value;
+            }
+            if (row.length > 0) {
+                rows.push(row);
             }
             // Skip newlines within bitmap
             while (this.peek() && this.peek().type === "newline") {
@@ -791,7 +797,8 @@ function isInDrawableRegion(x, y, header) {
         case "turret":
             return x < Math.floor(header.width / 2);
         case "block":
-            return x < Math.floor(header.width / 2) && y < Math.floor(header.height / 2);
+            // Top triangle: (0,0)→(W-1,0)→(halfW,halfH)
+            return y < Math.floor(header.height / 2) && x + y < header.width;
         default:
             return true;
     }
@@ -846,18 +853,51 @@ function applySymmetry(pixels, width, height, header, seriesMap, colorMap, palet
         }
     }
     if (header.template === "block") {
-        // Vertical mirror (top to bottom with color inversion)
+        // Block template: user draws in top triangle (0,0)→(W-1,0)→(halfW,halfH)
+        // Drawable region: y < halfH && x + y < width
+        //
+        // Step 1: Top → Right via reflection across x + y = W - 1
+        //   Formula: (x,y) → (W-1-y, W-1-x)
+        //
+        // Step 2: Top+Right → Bottom+Left via reflection across y = x + color inversion
+        //   Formula: (x,y) → (y,x)
+        const srcPixels = new Uint8ClampedArray(pixels);
+        // Step 1: Top → Right (simple copy)
         for (let y = 0; y < halfH; y++) {
             for (let x = 0; x < width; x++) {
                 const srcIdx = (y * width + x) * 4;
-                const dstY = height - 1 - y;
-                const dstIdx = (dstY * width + x) * 4;
+                if (srcPixels[srcIdx + 3] === 0)
+                    continue;
+                const dstX = width - 1 - y;
+                const dstY = width - 1 - x;
+                if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height)
+                    continue;
+                const dstIdx = (dstY * width + dstX) * 4;
+                pixels[dstIdx] = srcPixels[srcIdx];
+                pixels[dstIdx + 1] = srcPixels[srcIdx + 1];
+                pixels[dstIdx + 2] = srcPixels[srcIdx + 2];
+                pixels[dstIdx + 3] = srcPixels[srcIdx + 3];
+            }
+        }
+        // Step 2: Top+Right → Bottom+Left (reflection across y=x + color inversion)
+        // Read from pixels (has top+right after step 1). Reflected points land in
+        // bottom (y>x, x+y>W) or left (x<y, x+y<W) — never overlap top or right.
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const srcIdx = (y * width + x) * 4;
                 if (pixels[srcIdx + 3] === 0)
                     continue;
+                // Reflect across y=x: swap coordinates
+                const dstX = y;
+                const dstY = x;
+                if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height)
+                    continue;
+                const dstIdx = (dstY * width + dstX) * 4;
                 // Find color code and invert
                 const srcR = pixels[srcIdx];
                 const srcG = pixels[srcIdx + 1];
                 const srcB = pixels[srcIdx + 2];
+                let found = false;
                 for (const [code, hex] of palette) {
                     const [r, g, b] = hexToRgb(hex);
                     if (r === srcR && g === srcG && b === srcB) {
@@ -875,23 +915,16 @@ function applySymmetry(pixels, width, height, header, seriesMap, colorMap, palet
                             pixels[dstIdx + 2] = srcB;
                             pixels[dstIdx + 3] = 255;
                         }
+                        found = true;
                         break;
                     }
                 }
-            }
-        }
-        // Horizontal mirror (left to right, already has vertical mirror applied)
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < halfW; x++) {
-                const srcIdx = (y * width + x) * 4;
-                const dstX = width - 1 - x;
-                const dstIdx = (y * width + dstX) * 4;
-                if (pixels[srcIdx + 3] === 0)
-                    continue;
-                pixels[dstIdx] = pixels[srcIdx];
-                pixels[dstIdx + 1] = pixels[srcIdx + 1];
-                pixels[dstIdx + 2] = pixels[srcIdx + 2];
-                pixels[dstIdx + 3] = pixels[srcIdx + 3];
+                if (!found) {
+                    pixels[dstIdx] = srcR;
+                    pixels[dstIdx + 1] = srcG;
+                    pixels[dstIdx + 2] = srcB;
+                    pixels[dstIdx + 3] = 255;
+                }
             }
         }
     }

@@ -95,6 +95,7 @@
       align-items: center;
       justify-content: center;
       padding: 20px;
+      overflow: hidden;
       background: repeating-conic-gradient(#2d2d2d 0% 25%, #1d1d1d 0% 50%) 50% / 20px 20px;
     }
 
@@ -102,6 +103,9 @@
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       border: 1px solid #333;
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
     }
 
     .controls {
@@ -190,20 +194,39 @@
     <div class="editor-panel">
       <div class="panel-header">DSL Code</div>
       <textarea id="editor" spellcheck="false">dsl 1
-size 16 16
-template unit
+size 128 128
+template block
 palette {
-  1 #FF3333
-  2 #AA0000
-  3 #550000
-  4 #FFFFFF
+  1 #989AA4
+  2 #FEB380
+  3 #4A4B53
+  4 #6E7080
+  5 #EA8878
+  6 #BC5452
+  7 #181920
 }
-series 1 2 3
+series 1 4 3
+series 2 5 6
 
-// 身体
-rect 2,3 5,12 1
-// 眼睛
-rect 3,4 4,5 4
+// 斜线（先画，被后续元素覆盖）
+line 0,0 63,63 0 4
+
+// 外框 - 亮
+poly 0,0 63,0 63,28 40,28 28,40 28,63 0,63 1
+
+// 中框
+poly 0,0 56,0 56,22 36,22 22,36 22,56 0,56 4
+
+// 内框 - 暗
+poly 0,0 48,0 48,18 32,18 18,32 18,48 0,48 3
+
+// 中心镂空
+poly 0,0 40,0 40,14 28,14 14,28 14,40 0,40 7
+
+// 暖色装饰
+poly 0,16 40,16 40,28 0,28 2
+poly 0,18 36,18 36,26 0,26 5
+poly 0,20 32,20 32,24 0,24 6
 </textarea>
     </div>
 

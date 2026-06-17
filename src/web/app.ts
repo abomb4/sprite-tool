@@ -14,8 +14,9 @@ function renderToCanvas(
 
   canvas.width = w * scale;
   canvas.height = h * scale;
-  canvas.style.width = `${w * scale}px`;
-  canvas.style.height = `${h * scale}px`;
+  // Let CSS handle sizing via max-width/max-height
+  canvas.style.width = "";
+  canvas.style.height = "";
 
   const ctx = canvas.getContext("2d");
   if (!ctx) return;

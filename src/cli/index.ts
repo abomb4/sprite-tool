@@ -24,7 +24,7 @@ import { parseDSL, render, type RenderResult, type DSLError } from "../core/inde
 interface CLIOptions {
   input: string | null;
   output: string | null;
-  mode: "png" | "bitmap";
+  mode: "png" | "bitmap" | "png-to-bitmap";
   help: boolean;
 }
 
@@ -43,20 +43,23 @@ const HELP = `
 Mindustry Sprite DSL v${VERSION}
 
 用法:
-  sprite-dsl -i <input.dsl> [选项]
+  sprite-dsl -i <input> [选项]
+
+模式:
+  --dsl-to-png            DSL → PNG（默认）
+  --dsl-to-bitmap         DSL → 位图文本
+  --png-to-bitmap         PNG → 位图文本（提取调色板）
 
 选项:
-  -i, --input <file>      输入文件（.dsl）
+  -i, --input <file>      输入文件
   -o, --output <file>     输出文件（默认: 与输入同名，后缀根据模式）
-  --dsl-to-png            输出 PNG 图片（默认）
-  --dsl-to-bitmap         输出位图文本
   -h, --help              显示帮助
   -v, --version           显示版本
 
 示例:
   sprite-dsl -i unit.dsl -o unit.png
   sprite-dsl -i unit.dsl -o unit.txt --dsl-to-bitmap
-  sprite-dsl -i unit.dsl  # 输出 unit.png
+  sprite-dsl -i sprite.png -o sprite.txt --png-to-bitmap
 
 退出码:
   0  成功
@@ -116,6 +119,10 @@ function parseArgs(argv: string[]): CLIOptions {
 
       case "--dsl-to-bitmap":
         options.mode = "bitmap";
+        break;
+
+      case "--png-to-bitmap":
+        options.mode = "png-to-bitmap";
         break;
 
       default:
@@ -185,6 +192,100 @@ async function renderToPNG(
   return PNG.sync.write(png);
 }
 
+// Available color characters: 1-9, a-z, A-Z (61 total)
+const COLOR_CHARS = "123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+interface PNGToBitmapResult {
+  palette: Map<string, string>;
+  width: number;
+  height: number;
+  rows: string[];
+}
+
+function pngToBitmap(
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray
+): PNGToBitmapResult {
+  // Extract unique colors
+  const colorSet = new Set<string>();
+  for (let i = 0; i < width * height; i++) {
+    const idx = i * 4;
+    const r = pixels[idx];
+    const g = pixels[idx + 1];
+    const b = pixels[idx + 2];
+    const a = pixels[idx + 3];
+    if (a > 0) {
+      const hex = `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`.toUpperCase();
+      colorSet.add(hex);
+    }
+  }
+
+  if (colorSet.size > COLOR_CHARS.length) {
+    throw new Error(`颜色数量 (${colorSet.size}) 超过支持的最大数量 (${COLOR_CHARS.length})`);
+  }
+
+  // Build palette mapping: hex -> char
+  const palette = new Map<string, string>();
+  const reversePalette = new Map<string, string>();
+  let charIdx = 0;
+  for (const hex of colorSet) {
+    const ch = COLOR_CHARS[charIdx];
+    palette.set(ch, hex);
+    reversePalette.set(hex, ch);
+    charIdx++;
+  }
+
+  // Build bitmap rows
+  const rows: string[] = [];
+  for (let y = 0; y < height; y++) {
+    let row = "";
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const r = pixels[idx];
+      const g = pixels[idx + 1];
+      const b = pixels[idx + 2];
+      const a = pixels[idx + 3];
+
+      if (a === 0) {
+        row += "0";
+      } else {
+        const hex = `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`.toUpperCase();
+        row += reversePalette.get(hex) ?? "?";
+      }
+    }
+    rows.push(row);
+  }
+
+  return { palette, width, height, rows };
+}
+
+function formatDSLBitmap(result: PNGToBitmapResult): string {
+  const lines: string[] = [];
+
+  lines.push("dsl 1");
+  lines.push(`size ${result.width} ${result.height}`);
+  lines.push("template none");
+  lines.push("");
+
+  // Palette
+  lines.push("palette {");
+  for (const [ch, hex] of result.palette) {
+    lines.push(`  ${ch} ${hex}`);
+  }
+  lines.push("}");
+  lines.push("");
+
+  // Bitmap
+  lines.push("bitmap 0,0 {");
+  for (const row of result.rows) {
+    lines.push(`  ${row}`);
+  }
+  lines.push("}");
+
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -211,17 +312,65 @@ async function main(): Promise<void> {
 
   const inputPath = resolve(options.input);
 
+  // Determine output path
   let outputPath: string;
   if (options.output) {
     outputPath = resolve(options.output);
     if (!extname(outputPath)) {
-      outputPath += options.mode === "png" ? ".png" : ".txt";
+      if (options.mode === "png") {
+        outputPath += ".png";
+      } else if (options.mode === "png-to-bitmap") {
+        outputPath += ".dsl";
+      } else {
+        outputPath += ".txt";
+      }
     }
   } else {
-    const ext = options.mode === "png" ? ".png" : ".txt";
+    let ext: string;
+    if (options.mode === "png") {
+      ext = ".png";
+    } else if (options.mode === "png-to-bitmap") {
+      ext = ".dsl";
+    } else {
+      ext = ".txt";
+    }
     outputPath = inputPath.replace(/\.[^.]+$/, ext);
   }
 
+  // PNG to Bitmap mode
+  if (options.mode === "png-to-bitmap") {
+    let inputBuffer: Buffer;
+    try {
+      inputBuffer = readFileSync(inputPath);
+    } catch {
+      console.error(`错误: 无法读取文件 "${inputPath}"`);
+      process.exit(2);
+    }
+
+    const { PNG } = await import("pngjs");
+    let png: any;
+    try {
+      png = PNG.sync.read(inputBuffer);
+    } catch (e) {
+      console.error(`错误: 无法解析 PNG 文件 "${inputPath}"`);
+      process.exit(2);
+    }
+
+    const { width, height, data } = png;
+    const result = pngToBitmap(width, height, data);
+    const dsl = formatDSLBitmap(result);
+
+    try {
+      writeFileSync(outputPath, dsl, "utf-8");
+      console.log(`✓ 已生成 DSL: ${outputPath} (${width}x${height}, ${result.palette.size} 色)`);
+    } catch (e) {
+      console.error(`写入错误: ${e}`);
+      process.exit(2);
+    }
+    return;
+  }
+
+  // DSL to PNG/Bitmap mode
   let dslCode: string;
   try {
     dslCode = readFileSync(inputPath, "utf-8");

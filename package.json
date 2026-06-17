@@ -3,12 +3,25 @@
   "version": "0.1.0",
   "description": "Mindustry Sprite DSL - pixel graphics generator",
   "type": "module",
+  "bin": {
+    "sprite-dsl": "./dist/cli/index.js"
+  },
   "scripts": {
-    "build": "tsc && node scripts/build-web.js",
-    "web": "npm run build && npx serve dist/web -l 3000",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "build": "tsc && node build/build-web.js",
+    "build:cli": "npm run clean && tsc",
+    "build:web": "npm run clean && tsc && node build/build-web.js",
+    "web": "npm run build:web && npx serve dist/web -l 3000",
+    "cli": "node dist/cli/index.js",
     "dev": "npm run web"
   },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  },
   "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pngjs": "^6.0.0",
     "typescript": "^5.4.0",
     "serve": "^14.2.0"
   }

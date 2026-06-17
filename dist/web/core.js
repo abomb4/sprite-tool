@@ -1,12 +1,69 @@
+/**
+ * Mindustry Sprite DSL - Core Parser & Renderer
+ *
+ * 本模块提供 Mindustry 像素图形 DSL 的核心功能，可复用于浏览器和 Node.js。
+ *
+ * ## 公开 API
+ *
+ * ### 解析 & 渲染
+ *
+ * ```ts
+ * // 一步到位：解析 DSL 文本并渲染为像素数据
+ * renderDSL(input: string): { result?: RenderResult; errors: DSLError[] }
+ *
+ * // 分步执行：先解析为 AST
+ * parseDSL(input: string): { program?: DSLProgram; errors: DSLError[] }
+ *
+ * // 分步执行：渲染 AST 为像素数据
+ * render(program: DSLProgram): RenderResult
+ * ```
+ *
+ * ### 输入输出
+ *
+ * | 函数 | 输入 | 输出 |
+ * |------|------|------|
+ * | `parseDSL` | DSL 源代码字符串 | `DSLProgram` 或错误列表 |
+ * | `render` | `DSLProgram` | `RenderResult`（RGBA 像素数组） |
+ * | `renderDSL` | DSL 源代码字符串 | `RenderResult` 或错误列表 |
+ *
+ * ### 使用示例
+ *
+ * ```ts
+ * import { renderDSL } from "./core.js";
+ *
+ * const code = `
+ * dsl 1
+ * size 16 16
+ * template unit
+ * palette {
+ *   1 #FF3333
+ *   2 #AA0000
+ * }
+ * rect 0,0 7,15 1
+ * `;
+ *
+ * const { result, errors } = renderDSL(code);
+ * if (result) {
+ *   // result.pixels: Uint8ClampedArray (RGBA)
+ *   // result.width, result.height: 图像尺寸
+ * }
+ * ```
+ */
 // ============================================================================
-// Mindustry Sprite DSL - Core Parser & Compiler
+// Internal: Reserved keywords (内部实现 - 保留关键字)
 // ============================================================================
-// ---------------------------------------------------------------------------
-// Reserved keywords
-// ---------------------------------------------------------------------------
+/** 保留关键字，不能用作 define 名称 */
 const RESERVED_NAMES = new Set(["fx", "fy", "r90", "r180", "r270"]);
+/** 有效的模板类型 */
 const TEMPLATE_TYPES = new Set(["none", "unit", "turret", "block"]);
+/** 变换关键字 */
 const TRANSFORM_KEYWORDS = new Set(["fx", "fy", "r90", "r180", "r270"]);
+/**
+ * 词法分析：将 DSL 源代码转换为 token 序列
+ *
+ * @param input - DSL 源代码
+ * @returns Token 数组
+ */
 function tokenize(input) {
     const tokens = [];
     let pos = 0;
@@ -67,19 +124,6 @@ function tokenize(input) {
             column++;
             continue;
         }
-        // Number (possibly negative)
-        if ((ch >= "0" && ch <= "9") || (ch === "-" && pos + 1 < input.length && input[pos + 1] >= "0" && input[pos + 1] <= "9")) {
-            let num = ch;
-            pos++;
-            column++;
-            while (pos < input.length && input[pos] >= "0" && input[pos] <= "9") {
-                num += input[pos];
-                pos++;
-                column++;
-            }
-            tokens.push({ type: "number", value: num, line, column: column - num.length });
-            continue;
-        }
         // Hex color (#RRGGBB)
         if (ch === "#") {
             let hex = "#";
@@ -93,25 +137,49 @@ function tokenize(input) {
             tokens.push({ type: "string", value: hex, line, column: column - hex.length });
             continue;
         }
-        // Quoted string
-        if (ch === '"' || ch === "'") {
-            const quote = ch;
-            let str = "";
+        // Single character color codes (1-9) - always tokenized as color
+        if (ch >= "1" && ch <= "9") {
+            // Peek ahead: if next char is also a digit, this is a number
+            if (pos + 1 < input.length && input[pos + 1] >= "0" && input[pos + 1] <= "9") {
+                // Multi-digit number
+                let num = ch;
+                pos++;
+                column++;
+                while (pos < input.length && input[pos] >= "0" && input[pos] <= "9") {
+                    num += input[pos];
+                    pos++;
+                    column++;
+                }
+                tokens.push({ type: "number", value: num, line, column: column - num.length });
+                continue;
+            }
+            // Single digit - always a color code
+            tokens.push({ type: "color", value: ch, line, column });
             pos++;
             column++;
-            while (pos < input.length && input[pos] !== quote) {
-                str += input[pos];
+            continue;
+        }
+        // 0 is transparent
+        if (ch === "0") {
+            tokens.push({ type: "color", value: "0", line, column });
+            pos++;
+            column++;
+            continue;
+        }
+        // Negative numbers
+        if (ch === "-" && pos + 1 < input.length && input[pos + 1] >= "0" && input[pos + 1] <= "9") {
+            let num = ch;
+            pos++;
+            column++;
+            while (pos < input.length && input[pos] >= "0" && input[pos] <= "9") {
+                num += input[pos];
                 pos++;
                 column++;
             }
-            if (pos < input.length) {
-                pos++; // skip closing quote
-                column++;
-            }
-            tokens.push({ type: "string", value: str, line, column: column - str.length });
+            tokens.push({ type: "number", value: num, line, column: column - num.length });
             continue;
         }
-        // Color code or keyword/identifier
+        // Letters, underscores, etc. (keywords/identifiers)
         if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "_") {
             let word = ch;
             pos++;
@@ -124,20 +192,7 @@ function tokenize(input) {
                 pos++;
                 column++;
             }
-            // Single character that could be a color code
-            if (word.length === 1 && word !== "0") {
-                tokens.push({ type: "color", value: word, line, column: column - word.length });
-            }
-            else {
-                tokens.push({ type: "keyword", value: word, line, column: column - word.length });
-            }
-            continue;
-        }
-        // 0 is transparent
-        if (ch === "0") {
-            tokens.push({ type: "color", value: "0", line, column });
-            pos++;
-            column++;
+            tokens.push({ type: "keyword", value: word, line, column: column - word.length });
             continue;
         }
         // Unknown character, skip
@@ -146,9 +201,12 @@ function tokenize(input) {
     }
     return tokens;
 }
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Internal: Parser (内部实现 - 语法分析器)
+// ============================================================================
+/**
+ * 语法分析器：将 token 序列转换为 AST (DSLProgram)
+ */
 class Parser {
     tokens;
     pos = 0;
@@ -191,6 +249,15 @@ class Parser {
             message,
         });
     }
+    expectNumber() {
+        const tok = this.peek();
+        if (!tok || (tok.type !== "number" && tok.type !== "color")) {
+            this.error("Expected number");
+            return undefined;
+        }
+        this.advance();
+        return parseInt(tok.value, 10);
+    }
     parsePoint() {
         const xTok = this.peek();
         if (!xTok) {
@@ -198,13 +265,8 @@ class Parser {
             return undefined;
         }
         let x;
-        if (xTok.type === "number") {
+        if (xTok.type === "number" || xTok.type === "color") {
             x = parseInt(this.advance().value, 10);
-        }
-        else if (xTok.type === "color") {
-            // Single char could be ambiguous, but coordinates are numbers
-            this.error("Expected coordinate (x,y)");
-            return undefined;
         }
         else {
             this.error("Expected coordinate");
@@ -217,7 +279,7 @@ class Parser {
         }
         this.advance();
         const yTok = this.peek();
-        if (!yTok || yTok.type !== "number") {
+        if (!yTok || (yTok.type !== "number" && yTok.type !== "color")) {
             this.error("Expected y coordinate");
             return undefined;
         }
@@ -226,7 +288,7 @@ class Parser {
     }
     parseColor() {
         const tok = this.peek();
-        if (!tok || tok.type !== "color") {
+        if (!tok || (tok.type !== "color" && tok.type !== "number")) {
             this.error("Expected color code");
             return undefined;
         }
@@ -251,12 +313,9 @@ class Parser {
         const p2 = this.parsePoint();
         if (!p2)
             return undefined;
-        const radiusTok = this.peek();
-        if (!radiusTok || radiusTok.type !== "number") {
-            this.error("Expected radius");
+        const radius = this.expectNumber();
+        if (radius === undefined)
             return undefined;
-        }
-        const radius = parseInt(this.advance().value, 10);
         const color = this.parseColor();
         if (!color)
             return undefined;
@@ -271,11 +330,9 @@ class Parser {
                 return undefined;
             points.push(p);
         }
-        // Parse more points until we hit a color code
-        while (this.peek() && this.peek().type === "number") {
-            // Check if this is the start of a point (number followed by comma)
-            const savedPos = this.pos;
-            const numTok = this.peek();
+        // Parse more points until we hit something that's not a number/color followed by comma
+        while (this.peek() && (this.peek().type === "number" || this.peek().type === "color")) {
+            // Check if this is the start of a point (number/color followed by comma)
             const nextTok = this.tokens[this.pos + 1];
             if (nextTok && nextTok.type === "comma") {
                 // This is a point
@@ -284,7 +341,7 @@ class Parser {
                     points.push(p);
             }
             else {
-                // This might be a color code (single digit)
+                // This is the color code
                 break;
             }
         }
@@ -307,7 +364,7 @@ class Parser {
         const rows = [];
         while (this.peek() && this.peek().type !== "rbrace") {
             const tok = this.advance();
-            if (tok.type === "color" || tok.type === "keyword") {
+            if (tok.type === "color") {
                 rows.push(tok.value);
             }
             // Skip newlines within bitmap
@@ -373,7 +430,7 @@ class Parser {
                 transforms.push(tok.value);
                 this.advance();
             }
-            else if (tok.type === "number") {
+            else if (tok.type === "number" || tok.type === "color") {
                 // This is the start of a position
                 const pos = this.parsePoint();
                 if (pos) {
@@ -420,7 +477,7 @@ class Parser {
         }
         this.advance();
         const versionTok = this.peek();
-        if (!versionTok || versionTok.type !== "number") {
+        if (!versionTok || (versionTok.type !== "number" && versionTok.type !== "color")) {
             this.error("Expected DSL version number");
             return undefined;
         }
@@ -433,11 +490,19 @@ class Parser {
             return undefined;
         }
         this.advance();
-        const size = this.parsePoint();
-        if (!size) {
-            this.error("Invalid size format");
+        const widthTok = this.peek();
+        if (!widthTok || (widthTok.type !== "number" && widthTok.type !== "color" && widthTok.type !== "keyword")) {
+            this.error("Expected width");
             return undefined;
         }
+        const width = parseInt(this.advance().value, 10);
+        this.skipNewlines(); // skip any whitespace
+        const heightTok = this.peek();
+        if (!heightTok || (heightTok.type !== "number" && heightTok.type !== "color" && heightTok.type !== "keyword")) {
+            this.error("Expected height");
+            return undefined;
+        }
+        const height = parseInt(this.advance().value, 10);
         this.skipNewlines();
         // Parse optional template
         let template = "none";
@@ -470,7 +535,7 @@ class Parser {
         const palette = new Map();
         while (this.peek() && this.peek().type !== "rbrace") {
             const colorTok = this.peek();
-            if (colorTok.type !== "color") {
+            if (colorTok.type !== "color" && colorTok.type !== "number") {
                 this.error("Expected color code in palette");
                 break;
             }
@@ -508,7 +573,7 @@ class Parser {
         while (this.peek() && this.peek().type === "keyword" && this.peek().value === "series") {
             this.advance();
             const colors = [];
-            while (this.peek() && this.peek().type === "color") {
+            while (this.peek() && (this.peek().type === "color" || this.peek().type === "number")) {
                 const c = this.advance().value;
                 if (c === "0") {
                     this.error("Cannot use '0' in series (transparent)");
@@ -565,8 +630,8 @@ class Parser {
         return {
             header: {
                 version,
-                width: size.x,
-                height: size.y,
+                width,
+                height,
                 template,
             },
             palette,
@@ -579,9 +644,15 @@ class Parser {
         return this.errors;
     }
 }
-// ---------------------------------------------------------------------------
-// Compiler
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Internal: Compiler (内部实现 - 编译器)
+// ============================================================================
+/**
+ * 计算多个绘图命令的包围盒
+ *
+ * @param commands - 绘图命令列表
+ * @returns 包围盒 { x, y, w, h }
+ */
 function getBoundingBox(commands) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const cmd of commands) {
@@ -825,7 +896,90 @@ function applySymmetry(pixels, width, height, header, seriesMap, colorMap, palet
         }
     }
 }
-export function compile(program, transformOrigin = true) {
+// ============================================================================
+// Public API (公开 API)
+// ============================================================================
+/**
+ * 解析 DSL 源代码为 AST
+ *
+ * @param input - DSL 源代码字符串
+ * @returns 解析结果，包含 program（成功时）和 errors（失败时）
+ *
+ * @example
+ * ```ts
+ * const { program, errors } = parseDSL(`
+ *   dsl 1
+ *   size 16 16
+ *   palette { 1 #FF0000 }
+ *   rect 0,0 15,15 1
+ * `);
+ *
+ * if (program) {
+ *   console.log(program.header.width);  // 16
+ *   console.log(program.palette.size);  // 1
+ * }
+ * ```
+ */
+export function parseDSL(input) {
+    const tokens = tokenize(input);
+    const parser = new Parser(tokens);
+    const program = parser.parse();
+    return { program, errors: parser.getErrors() };
+}
+/**
+ * 解析并渲染 DSL 源代码（一步到位）
+ *
+ * @param input - DSL 源代码字符串
+ * @returns 渲染结果，包含 result（成功时）和 errors（失败时）
+ *
+ * @example
+ * ```ts
+ * const { result, errors } = renderDSL(`
+ *   dsl 1
+ *   size 16 16
+ *   template unit
+ *   palette { 1 #FF3333 2 #AA0000 }
+ *   rect 0,0 7,15 1
+ * `);
+ *
+ * if (result) {
+ *   // result.pixels: Uint8ClampedArray (RGBA)
+ *   // result.width: 16
+ *   // result.height: 16
+ *
+ *   // 渲染到 canvas
+ *   const ctx = canvas.getContext("2d");
+ *   const imageData = ctx.createImageData(result.width, result.height);
+ *   imageData.data.set(result.pixels);
+ *   ctx.putImageData(imageData, 0, 0);
+ * }
+ * ```
+ */
+export function renderDSL(input) {
+    const { program, errors } = parseDSL(input);
+    if (!program) {
+        return { errors };
+    }
+    const result = render(program);
+    return { result, errors: [] };
+}
+/**
+ * 渲染 AST 为像素数据
+ *
+ * @param program - 解析后的 DSL 程序（由 parseDSL 返回）
+ * @returns 渲染结果，包含 RGBA 像素数组
+ *
+ * @example
+ * ```ts
+ * const { program } = parseDSL(code);
+ * if (program) {
+ *   const result = render(program);
+ *   // result.pixels: Uint8ClampedArray (RGBA, 每 4 字节一个像素)
+ *   // result.width, result.height: 图像尺寸
+ * }
+ * ```
+ */
+export function render(program) {
     const { header, palette, defines, commands } = program;
     const { width, height } = header;
     const colorMap = buildColorMap(palette);
@@ -858,7 +1012,6 @@ export function compile(program, transformOrigin = true) {
         }
     }
     function drawLine(cmd) {
-        // Bresenham's line algorithm with thickness
         const dx = Math.abs(cmd.p2.x - cmd.p1.x);
         const dy = Math.abs(cmd.p2.y - cmd.p1.y);
         const sx = cmd.p1.x < cmd.p2.x ? 1 : -1;
@@ -867,7 +1020,6 @@ export function compile(program, transformOrigin = true) {
         let x = cmd.p1.x;
         let y = cmd.p1.y;
         while (true) {
-            // Draw circle at (x, y) with radius
             for (let ry = -cmd.radius; ry <= cmd.radius; ry++) {
                 for (let rx = -cmd.radius; rx <= cmd.radius; rx++) {
                     if (rx * rx + ry * ry <= cmd.radius * cmd.radius) {
@@ -889,7 +1041,6 @@ export function compile(program, transformOrigin = true) {
         }
     }
     function drawPoly(cmd) {
-        // Simple scanline fill
         if (cmd.points.length < 3)
             return;
         let minY = Infinity, maxY = -Infinity;
@@ -924,7 +1075,7 @@ export function compile(program, transformOrigin = true) {
             for (let col = 0; col < line.length; col++) {
                 const color = line[col];
                 if (color === "0")
-                    continue; // transparent
+                    continue;
                 setPixel(cmd.origin.x + col, cmd.origin.y + row, color);
             }
         }
@@ -933,25 +1084,21 @@ export function compile(program, transformOrigin = true) {
         const block = defines.get(cmd.name);
         if (!block)
             return [];
-        // Get bounding box of the define block
         const bb = getBoundingBox(block.commands);
         const bbCopy = { ...bb };
         const resolved = [];
         for (const innerCmd of block.commands) {
             let newCmd = { ...innerCmd };
             if ("p1" in newCmd && "p2" in newCmd) {
-                // rect or line
                 const p1 = transformPoint({ x: newCmd.p1.x - bb.x, y: newCmd.p1.y - bb.y }, bbCopy, cmd.transforms);
                 const p2 = transformPoint({ x: newCmd.p2.x - bb.x, y: newCmd.p2.y - bb.y }, bbCopy, cmd.transforms);
                 newCmd.p1 = { x: p1.x + cmd.position.x, y: p1.y + cmd.position.y };
                 newCmd.p2 = { x: p2.x + cmd.position.x, y: p2.y + cmd.position.y };
             }
             else if ("points" in newCmd) {
-                // poly
                 newCmd.points = newCmd.points.map(p => transformPoint({ x: p.x - bb.x, y: p.y - bb.y }, bbCopy, cmd.transforms)).map(p => ({ x: p.x + cmd.position.x, y: p.y + cmd.position.y }));
             }
             else if ("origin" in newCmd) {
-                // bitmap
                 const o = transformPoint({ x: newCmd.origin.x - bb.x, y: newCmd.origin.y - bb.y }, bbCopy, cmd.transforms);
                 newCmd.origin = { x: o.x + cmd.position.x, y: o.y + cmd.position.y };
             }
@@ -959,7 +1106,6 @@ export function compile(program, transformOrigin = true) {
         }
         return resolved;
     }
-    // Execute all commands
     for (const cmd of commands) {
         if ("type" in cmd) {
             switch (cmd.type) {
@@ -978,7 +1124,6 @@ export function compile(program, transformOrigin = true) {
             }
         }
         else {
-            // UseCmd
             const resolved = resolveUseCmd(cmd);
             for (const r of resolved) {
                 switch (r.type) {
@@ -998,25 +1143,7 @@ export function compile(program, transformOrigin = true) {
             }
         }
     }
-    // Apply symmetry
     applySymmetry(pixels, width, height, header, seriesMap, colorMap, palette);
     return { width, height, pixels };
 }
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-export function parseDSL(input) {
-    const tokens = tokenize(input);
-    const parser = new Parser(tokens);
-    const program = parser.parse();
-    return { program, errors: parser.getErrors() };
-}
-export function compileDSL(input) {
-    const { program, errors } = parseDSL(input);
-    if (!program) {
-        return { errors };
-    }
-    const result = compile(program);
-    return { result, errors: [] };
-}
-//# sourceMappingURL=core.js.map
+//# sourceMappingURL=index.js.map

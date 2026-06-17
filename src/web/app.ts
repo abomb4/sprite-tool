@@ -1,4 +1,4 @@
-import { parseDSL, render, type RenderResult, type DSLError } from "../src/core.js";
+import { parseDSL, render, type RenderResult, type DSLError } from "../core/index.js";
 
 // ---------------------------------------------------------------------------
 // Render to canvas (DOM dependent, not in core)

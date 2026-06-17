@@ -25,4 +25,4 @@ bitmap 6,4 {
 poly 1,0 4,0 4,4 3
 
 // another rect (5,0)-(8,2)
-rect 5,0 8,2 2
+rect 5,0 8,2 0 2

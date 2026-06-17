@@ -83,6 +83,8 @@ export interface RectCmd {
   p1: Point;
   /** 右下角坐标 */
   p2: Point;
+  /** 切角边长（0 表示无切角） */
+  chamfer: number;
   /** 颜色代码 */
   color: string;
 }
@@ -511,10 +513,13 @@ class Parser {
     const p2 = this.parsePoint();
     if (!p2) return undefined;
 
+    const chamfer = this.expectNumber();
+    if (chamfer === undefined) return undefined;
+
     const color = this.parseColor();
     if (!color) return undefined;
 
-    return { type: "rect", p1, p2, color };
+    return { type: "rect", p1, p2, chamfer, color };
   }
 
   private parseLine(): LineCmd | undefined {
@@ -1325,9 +1330,18 @@ export function render(program: DSLProgram): RenderResult {
     const y1 = Math.min(cmd.p1.y, cmd.p2.y);
     const x2 = Math.max(cmd.p1.x, cmd.p2.x);
     const y2 = Math.max(cmd.p1.y, cmd.p2.y);
+    const c = cmd.chamfer;
 
     for (let y = y1; y <= y2; y++) {
       for (let x = x1; x <= x2; x++) {
+        // 四角切角：像素到最近角的曼哈顿距离 < chamfer 则跳过
+        if (c > 0) {
+          const dTL = (x - x1) + (y - y1);
+          const dTR = (x2 - x) + (y - y1);
+          const dBL = (x - x1) + (y2 - y);
+          const dBR = (x2 - x) + (y2 - y);
+          if (dTL < c || dTR < c || dBL < c || dBR < c) continue;
+        }
         setPixel(x, y, cmd.color);
       }
     }
@@ -1483,4 +1497,91 @@ export function render(program: DSLProgram): RenderResult {
   applySymmetry(pixels, width, height, header, seriesMap, colorMap, palette);
 
   return { width, height, pixels };
+}
+
+// ============================================================================
+// generateDSL — 从 DSLProgram AST 生成 DSL 源代码字符串
+// ============================================================================
+
+/** 从 DSLProgram 生成 DSL 源代码 */
+export function generateDSL(program: DSLProgram): string {
+  const lines: string[] = [];
+
+  lines.push(`dsl ${program.header.version}`);
+  if (program.header.symmetry) {
+    lines.push(`symmetry ${program.header.symmetry}`);
+  }
+  lines.push(`size ${program.width} ${program.height}`);
+  lines.push(`template ${program.header.template}`);
+
+  // palette
+  if (program.palette.size > 0) {
+    lines.push('palette {');
+    for (const [code, hex] of program.palette) {
+      lines.push(`  ${code} ${hex}`);
+    }
+    lines.push('}');
+  }
+
+  // series
+  if (program.series.length > 0) {
+    for (const s of program.series) {
+      lines.push(`series {`);
+      lines.push(`  ${s.colors.join(' ')}`);
+      lines.push('}');
+    }
+  }
+
+  // defines
+  if (program.defines) {
+    for (const [name, block] of program.defines) {
+      lines.push(`define ${name} {`);
+      for (const cmd of block.commands) {
+        lines.push(`  ${cmdToString(cmd)}`);
+      }
+      lines.push('}');
+    }
+  }
+
+  // commands
+  for (const cmd of program.commands) {
+    if ('type' in cmd) {
+      lines.push(cmdToString(cmd));
+    } else {
+      // UseCmd
+      const use = cmd as UseCmd;
+      let s = `use ${use.name} ${use.position.x},${use.position.y}`;
+      if (use.transforms.flipX) s += ' flipX';
+      if (use.transforms.flipY) s += ' flipY';
+      if (use.transforms.rotate !== 0) s += ` rotate ${use.transforms.rotate}`;
+      lines.push(s);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function cmdToString(cmd: DrawCommand): string {
+  switch (cmd.type) {
+    case 'rect':
+      if (cmd.chamfer > 0) {
+        return `rect ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} ${cmd.chamfer} ${cmd.color}`;
+      }
+      return `rect ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} 0 ${cmd.color}`;
+    case 'line':
+      if (cmd.radius > 0) {
+        return `line ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} ${cmd.color} ${cmd.radius}`;
+      }
+      return `line ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} ${cmd.color}`;
+    case 'poly': {
+      const pts = cmd.points.map(p => `${p.x},${p.y}`).join(' ');
+      return `poly ${pts} ${cmd.color}`;
+    }
+    case 'bitmap': {
+      const rows = cmd.rows.map(row => row.join(''));
+      return `bitmap ${cmd.origin.x},${cmd.origin.y} ${rows.join(' ')}`;
+    }
+    default:
+      return '';
+  }
 }

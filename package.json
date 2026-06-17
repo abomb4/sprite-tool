@@ -1,0 +1,15 @@
+{
+  "name": "sprite-dsl-tools",
+  "version": "0.1.0",
+  "description": "Mindustry Sprite DSL - pixel graphics generator",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && node scripts/build-web.js",
+    "web": "npm run build && npx serve dist/web -l 3000",
+    "dev": "npm run web"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "serve": "^14.2.0"
+  }
+}

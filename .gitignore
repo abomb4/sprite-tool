@@ -1,6 +1,7 @@
 node_modules/
 dist/core/
 dist/cli/
+tests/*/out/
 *.js.map
 .DS_Store
 Thumbs.db

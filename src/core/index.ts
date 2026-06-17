@@ -849,9 +849,13 @@ class Parser {
       this.skipNewlines();
     }
 
+    // 防止 series 与 define/commands 之间有注释空行
+    this.skipNewlines();
+
     // Parse defines
     const defines = new Map<string, DefineBlock>();
     while (this.peek() && this.peek()!.type === "keyword" && this.peek()!.value === "define") {
+      this.advance();
       const def = this.parseDefine();
       if (def) {
         if (defines.has(def.name)) {
@@ -862,6 +866,9 @@ class Parser {
       }
       this.skipNewlines();
     }
+
+    // 防止 define 与 commands 之间有注释空行
+    this.skipNewlines();
 
     // Parse drawing commands
     const commands: (DrawCommand | UseCmd)[] = [];

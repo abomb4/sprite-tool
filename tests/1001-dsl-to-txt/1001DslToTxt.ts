@@ -1,10 +1,12 @@
 import { parseDSL, render } from "../../src/core/index.js";
-import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "fs";
 import { join, basename } from "path";
 
 const CASES_DIR = join(import.meta.dirname, "cases");
 const OUT_DIR = join(import.meta.dirname, "out");
 
+// 清空 out 目录，避免残留文件影响
+rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(OUT_DIR, { recursive: true });
 
 // ---------------------------------------------------------------------------

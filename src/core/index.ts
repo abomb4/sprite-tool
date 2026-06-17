@@ -1354,35 +1354,58 @@ export function render(program: DSLProgram): RenderResult {
     }
   }
 
+  /** 点到线段距离平方 */
+  function distToSegmentSq(
+    px: number, py: number,
+    x1: number, y1: number,
+    x2: number, y2: number,
+  ): number {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+
+    if (lenSq === 0) {
+      // 退化：线段是一个点
+      const ex = px - x1;
+      const ey = py - y1;
+      return ex * ex + ey * ey;
+    }
+
+    // 投影参数 t，钳制到 [0, 1] 确保落在线段上
+    let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+
+    const nearX = x1 + t * dx;
+    const nearY = y1 + t * dy;
+    const ex = px - nearX;
+    const ey = py - nearY;
+    return ex * ex + ey * ey;
+  }
+
   function drawLine(cmd: LineCmd): void {
-    const dx = Math.abs(cmd.p2.x - cmd.p1.x);
-    const dy = Math.abs(cmd.p2.y - cmd.p1.y);
-    const sx = cmd.p1.x < cmd.p2.x ? 1 : -1;
-    const sy = cmd.p1.y < cmd.p2.y ? 1 : -1;
-    let err = dx - dy;
+    const { p1, p2, radius, color } = cmd;
+    const rSq = radius * radius;
 
-    let x = cmd.p1.x;
-    let y = cmd.p1.y;
+    // 包含粗线的 bounding box，夹在画布范围内
+    const minX = Math.max(0, Math.min(p1.x, p2.x) - radius);
+    const maxX = Math.min(width - 1, Math.max(p1.x, p2.x) + radius);
+    const minY = Math.max(0, Math.min(p1.y, p2.y) - radius);
+    const maxY = Math.min(height - 1, Math.max(p1.y, p2.y) + radius);
 
-    while (true) {
-      for (let ry = -cmd.radius; ry <= cmd.radius; ry++) {
-        for (let rx = -cmd.radius; rx <= cmd.radius; rx++) {
-          if (rx * rx + ry * ry <= cmd.radius * cmd.radius) {
-            setPixel(x + rx, y + ry, cmd.color);
-          }
+    // 预取颜色值（避免每次 setPixel 都做 Map.get）
+    const rgb = colorMap.get(color);
+    if (!rgb) return;
+
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (distToSegmentSq(x, y, p1.x, p1.y, p2.x, p2.y) <= rSq) {
+          if (!isInDrawableRegion(x, y, header)) continue;
+          const idx = (y * width + x) * 4;
+          pixels[idx] = rgb[0];
+          pixels[idx + 1] = rgb[1];
+          pixels[idx + 2] = rgb[2];
+          pixels[idx + 3] = 255;
         }
-      }
-
-      if (x === cmd.p2.x && y === cmd.p2.y) break;
-
-      const e2 = 2 * err;
-      if (e2 > -dy) {
-        err -= dy;
-        x += sx;
-      }
-      if (e2 < dx) {
-        err += dx;
-        y += sy;
       }
     }
   }

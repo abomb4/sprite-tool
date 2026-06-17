@@ -17,17 +17,21 @@
 <script lang="ts">
 import { defineComponent, ref, watch, onMounted } from 'vue'
 import { editorStore } from '../stores/editorStore'
-import { parseDSL, render } from '@core/index.js'
+import { createFileStore } from '../stores/fileStore'
 
 export default defineComponent({
   name: 'EditorArea',
   setup() {
     const store = editorStore
     const state = store.state
+    const fileStore = createFileStore(editorStore)
     const editorRef = ref<HTMLTextAreaElement | null>(null)
 
-    // 初始加载默认 DSL 代码
+    // 初始加载默认 DSL 代码（仅在没有任何文件时）
     onMounted(() => {
+      // 如果 fileStore 已经通过文件列表加载了代码，就不覆盖
+      if (state.dslCode) return
+
       const defaultCode = `dsl 1
 size 128 128
 template block
@@ -39,6 +43,7 @@ palette {
   5 #d4c218
 }
 series 1 2 3
+series 4 5
 
 // 底座
 rect 0,0 127,127 10 1
@@ -54,8 +59,14 @@ rect 52,52 75,75 6 2
 
 // 底座 line
 line 6,6 127,127 1 2
+// 上层花纹
+poly 56,0 40,16 87,16 71,0 5
+poly 41,16 56,31 72,31 86,16 4
+poly 55,40 40,55 40,48 48,40 5
+poly 73,40 87,54 87,47 80,40 5
 `
       store.parseAndRender(defaultCode)
+      fileStore.saveCurrentFile(defaultCode)
     })
 
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -68,6 +79,8 @@ line 6,6 127,127 1 2
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {
         store.parseAndRender(code)
+        // 自动保存到当前文件
+        fileStore.saveCurrentFile(code)
       }, 150)
     }
 

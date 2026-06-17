@@ -16,7 +16,10 @@
       @mouseup="onSplitterMouseUp"
       @mouseleave="onSplitterMouseUp"
     >
-      <!-- 左侧：代码编辑器 -->
+      <!-- 左侧：文件面板 -->
+      <FilePanel />
+
+      <!-- 中间：代码编辑器 -->
       <div class="editor-panel" :style="{ width: splitterPos + 'px' }">
         <EditorArea />
       </div>
@@ -50,10 +53,12 @@
 <script lang="ts">
 import { defineComponent, ref, onMounted } from 'vue'
 import { editorStore } from './stores/editorStore'
+import { createFileStore } from './stores/fileStore'
 import EditorArea from './components/EditorArea.vue'
 import Toolbar from './components/Toolbar.vue'
 import CanvasRenderer from './components/canvas/CanvasRenderer.vue'
 import StatusBar from './components/StatusBar.vue'
+import FilePanel from './components/FilePanel.vue'
 
 const MIN_EDITOR_WIDTH = 200
 const MIN_PREVIEW_WIDTH = 300
@@ -65,6 +70,7 @@ export default defineComponent({
     Toolbar,
     CanvasRenderer,
     StatusBar,
+    FilePanel,
   },
   setup() {
     const state = editorStore.state
@@ -205,11 +211,8 @@ export default defineComponent({
 
 .preview-area {
   flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
   overflow: auto;
+  padding: 0;
   background: repeating-conic-gradient(#2d2d2d 0% 25%, #1d1d1d 0% 50%) 50% / 20px 20px;
 }
 

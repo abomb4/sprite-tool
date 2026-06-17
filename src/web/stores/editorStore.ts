@@ -1,16 +1,11 @@
-import { reactive, provide } from 'vue'
-import { parseDSL, generateDSL, type DSLProgram, type DSLError } from '@core/index.js'
+import { reactive } from 'vue'
+import { parseDSL, type DSLProgram, type DSLError, type Point } from '@core/index.js'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 export type ToolType = 'select' | 'rect' | 'line' | 'poly' | 'bitmap' | 'eyedropper'
-
-export interface Point {
-  x: number
-  y: number
-}
 
 export interface EditorState {
   // DSL 代码
@@ -37,6 +32,9 @@ export interface EditorState {
 
   // 工具预览
   toolPreview: any
+
+  // 强制刷新信号（递增计数器，CanvasRenderer watch 此值触发重绘）
+  refreshKey: number
 }
 
 // ============================================================================
@@ -58,6 +56,7 @@ export function createEditorState(): EditorState {
     undoStack: [],
     redoStack: [],
     toolPreview: null,
+    refreshKey: 0,
   }) as EditorState
 }
 
@@ -71,6 +70,7 @@ export interface EditorStore {
   pushSnapshot: () => void
   undo: () => void
   redo: () => void
+  refreshCanvas: () => void
 }
 
 let storeInstance: EditorStore | null = null
@@ -92,21 +92,76 @@ export function createEditorStore(): EditorStore {
     state.errors = errors
   }
 
+  /* ── 将单个绘图命令转为一行动态 DSL ─────────────────────── */
+
+  function commandToDSL(cmd: any): string {
+    switch (cmd.type) {
+      case 'poly': {
+        const pts = (cmd.points as Point[]).map(p => `${p.x},${p.y}`).join(' ')
+        return `poly ${pts} ${cmd.color}`
+      }
+      case 'rect':
+        return `rect ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} 0 ${cmd.color}`
+      case 'line':
+        return `line ${cmd.p1.x},${cmd.p1.y} ${cmd.p2.x},${cmd.p2.y} 1 ${cmd.color}`
+      default:
+        return ''
+    }
+  }
+
+  /** 将 AST 中的 commands 以 DSL 文本行形式返回（用于局部重写） */
+  function commandsToDSL(commands: any[]): string {
+    return commands.map(cmd => commandToDSL(cmd)).filter(Boolean).join('\n')
+  }
+
   function syncCodeFromAST(): void {
     if (!state.program) return
-    state.dslCode = generateDSL(state.program)
+    // 用本地命令序列化替换整个 commands 区域
+    // 拆分头部（固定部分）和尾部（命令区）
+    const headerEnd = findCommandsStart(state.dslCode)
+    const cmdsText = commandsToDSL(state.program.commands)
+    state.dslCode = headerEnd + '\n' + cmdsText + '\n'
+    const { program, errors } = parseDSL(state.dslCode)
+    state.program = program ?? null
+    state.errors = errors
+  }
+
+  /** 在 DSL 源码中找到命令区的起始位置（跳过 header / palette / series / define 块） */
+  function findCommandsStart(dsl: string): string {
+    // 简单策略：保留所有以关键字 poly/rect/line/bitmap/use 开头的行之前的部分
+    const lines = dsl.split('\n')
+    const headerLines: string[] = []
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (/^(poly|rect|line|bitmap|use)\b/.test(trimmed)) break
+      headerLines.push(line)
+    }
+    // 如果没有找到命令起始行，返回原代码
+    if (headerLines.length === lines.length) return dsl
+    return headerLines.join('\n')
   }
 
   function addCommand(cmd: any): void {
     if (!state.program) return
     pushSnapshot()
-    state.program.commands.push(cmd)
-    syncCodeFromAST()
+
+    // 生成单行 DSL 并追加到现有代码末尾
+    const line = commandToDSL(cmd)
+    if (!line) return
+
+    state.dslCode = state.dslCode.trimEnd() + '\n' + line + '\n'
+
+    // 重新解析，更新 program 和 errors
+    const { program, errors } = parseDSL(state.dslCode)
+    state.program = program ?? null
+    state.errors = errors
   }
 
   function modifyCommand(index: number, cmd: any): void {
     if (!state.program || index < 0 || index >= state.program.commands.length) return
     pushSnapshot()
+
+    // 直接修改 AST，然后用 syncCodeFromAST 局部重写
     state.program.commands[index] = cmd
     syncCodeFromAST()
   }
@@ -114,6 +169,7 @@ export function createEditorStore(): EditorStore {
   function deleteCommand(index: number): void {
     if (!state.program) return
     pushSnapshot()
+
     state.program.commands.splice(index, 1)
     syncCodeFromAST()
   }

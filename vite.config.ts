@@ -21,7 +21,7 @@ export default defineConfig({
       },
     },
     minify: 'esbuild',
-    sourcemap: true,
+    sourcemap: false,  // 生产构建不需要 sourcemap，加速构建
   },
 
   resolve: {
@@ -33,6 +33,10 @@ export default defineConfig({
 
   server: {
     port: 3000,
-    open: true,
+    open: false,  // 关闭自动打开浏览器，减少启动干扰
+    warmup: {
+      // 预编译入口文件和核心模块，减少首次请求延迟
+      clientFiles: ['./main.ts', './App.vue', './components/canvas/CanvasRenderer.vue'],
+    },
   },
 })
